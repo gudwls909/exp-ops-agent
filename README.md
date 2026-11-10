@@ -26,7 +26,7 @@ ops/approvals.py (승인 대기열) ◀── 사람: ops/approve.py ──▶ t
 ```bash
 python eval/run_eval.py --repeat 3                 # dev: 실패 8종 job을 실제 GPU에서 띄우고 Agent와 규칙 비교
 python eval/run_eval.py --set heldout --repeat 3   # held-out: 개발 중에 보지 않은 조건
-pytest                               # 안전장치·파싱·검증 테스트 41개
+pytest                               # 안전장치·파싱·검증·메모리 테스트 48개
 ```
 
 - 실패 주입 시뮬레이터가 8종 job(정상, 완료, 느리지만 정상, hang, 종료 시 hang, crash, OOM, NaN)을 **랜덤 id**로 띄운다. 정답은 평가 스크립트만 안다.
@@ -92,6 +92,23 @@ python eval/run_fix_eval.py --set heldout --repeat 2
 Agent가 틀린 2개는 "살아 있는데 오래 조용한 job"을 healthy/finished로 본 것 (근거에는 13배 침묵을 적어 놓고 결론은 정상).
 분석과 고칠 방향: [docs/troubleshooting_log.md](docs/troubleshooting_log.md) 17~19번
 
+### Runbook 메모리 (Voyager skill library 방식)
+
+실행해서 **결과가 확인된** 조치만 runbook으로 저장하고(실패한 조치도 "안 됐다"로 기록), 로그에서 코드로 뽑은 장애 서명이
+비슷한 다음 장애에서 꺼내 준다. 숫자가 아니라 관계("멈춘 shard를 뺐다", "micro-batch 131072는 이 GPU에 들어갔다")를 저장한다.
+반복해서 실패한 조치는 검증 단계에서 거부한다.
+
+```bash
+python eval/run_memory_eval.py --episodes 3   # memory off/on, 같은 장애 순서, 에피소드당 최대 3라운드
+```
+
+| | 해결 | shard 멈춤 해결 라운드 (ep1, ep2, ep3) | 에피소드당 비용 |
+|---|---|---|---|
+| memory off | 5/6 | R2, 실패, R2 | $0.036 |
+| memory on | 6/6 | R2, **R1**, R3 | $0.029 |
+
+에피소드 3개라 아직 우연과 구분되지 않는다. 1차 실행의 더 좋아 보이던 숫자는 결과 판정(critic) 버그 때문이었다 — troubleshooting_log 20~22번.
+
 평가로 찾아서 고친 것
 
 | 발견 | 원인 | 조치 | 결과 |
@@ -121,5 +138,6 @@ Agent가 틀린 2개는 "살아 있는데 오래 조용한 job"을 healthy/finis
 - [x] 원인을 고친 재시작 제안 + 수정 평가 (수정 성공 + 의미 보존)
 - [x] 근거 대조(보고서에 인용한 오류가 그 job 로그에 실제로 있나), 수정 평가 held-out
 - [ ] 일관성 검사(살아 있는데 오래 조용한 job을 정상으로 보고하면 거부) + 새 held-out
-- [ ] 검증된 조치를 runbook skill로 저장·재사용 (memory) + ablation
+- [x] 검증된 조치를 runbook으로 저장·재사용 (memory) + 1차 ablation
+- [ ] memory ablation 확대 (에피소드·seed 늘리기)
 - [ ] FastAPI 승인 API, Docker

@@ -71,6 +71,8 @@ def parse_args():
 
     # ---- 시뮬레이터 환경 (Agent에게 보이지 않는다. "디스크에 있는 손상된 파일" 같은 바깥 상황) ----
     p.add_argument("--bad-shards", default="", help="손상된 shard 번호 (예: 3). 이 shard를 읽으면 KeyError")
+    p.add_argument("--stall-shards", default="", help="읽으면 멈추는 shard 번호 (예: 느린 NFS의 깨진 파일). "
+                   "일시적 hang과 달리 재시작해도 그 shard에서 또 멈춘다")
     return p.parse_args()
 
 
@@ -137,6 +139,7 @@ def main():
         json.dump({k: getattr(args, k) for k in CONFIG_KEYS}, f, indent=2)
     shards = [int(x) for x in args.data_shards.split(",") if x.strip() != ""]
     bad_shards = {int(x) for x in args.bad_shards.split(",") if x.strip() != ""}
+    stall_shards = {int(x) for x in args.stall_shards.split(",") if x.strip() != ""}
 
     # SIGTERM(일반 kill)을 받으면 체크포인트를 저장하고 깔끔하게 끝낸다.
     # kill -9(SIGKILL)는 잡을 수 없다 → 체크포인트 없이 즉사. Agent가 어떤 kill을 쓰느냐가 중요한 이유.
@@ -202,8 +205,11 @@ def main():
             log.info(f"curriculum: entering stage 2, batch_size={batch_size} grad_accum={args.grad_accum} "
                      f"lr={lr_at(step, args):.1e}")
         shard = shards[(step - 1) // args.shard_steps % len(shards)] if shards else None
-        if shard is not None and (step - 1) % args.shard_steps == 0:
+        # shard 시작 step, 또는 재시작 직후 첫 step(중간부터 이어 읽어도 파일은 다시 연다)
+        if shard is not None and ((step - 1) % args.shard_steps == 0 or step == start + 1):
             log.info(f"data: reading shard data/shard-{shard:04d}.tar")
+            if shard in stall_shards:
+                hang_forever()  # 에러도 없이 멈춘다. 로그 마지막 줄이 "reading shard ..."로 남는 게 유일한 단서
 
         # gradient accumulation: batch를 grad_accum개로 나눠 forward/backward → 메모리는 1/grad_accum, 결과는 같은 batch
         opt.zero_grad()

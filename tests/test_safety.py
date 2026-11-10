@@ -80,7 +80,8 @@ def test_mcp_exposes_no_execute_tools():
 
     tools = asyncio.run(names())
     # 읽기 전용만. 요청도 도구가 아님
-    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status", "job_config", "list_checkpoints"}
+    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status", "job_config", "list_checkpoints",
+                     "find_runbooks"}
     # 혹시 누가 실행 도구를 추가하면 이 테스트가 깨진다 → 리뷰에서 "왜 추가했나" 논의하게 된다
 
 

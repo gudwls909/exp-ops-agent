@@ -287,9 +287,12 @@ def validate_changes(job_id: str, changes: dict | None, resume_from: int | None)
                 raise ValueError(f"data_shards는 기존 shard {old}에서 빼는 것만 가능: {new}")
             # 데이터를 빼는 건 실험을 바꾸는 일 → 이 job의 로그에 "그 shard가 손상됐다"는 증거가 있을 때만 허용
             log = "\n".join(tail(job_id, 100000))
-            no_proof = [k for k in set(old) - set(new) if f"corrupted shard data/shard-{k:04d}" not in log]
+            stalled = stall_shards(job_id)
+            no_proof = [k for k in set(old) - set(new)
+                        if f"corrupted shard data/shard-{k:04d}" not in log and k not in stalled]
             if no_proof:
-                raise ValueError(f"shard {sorted(no_proof)}가 손상됐다는 증거가 이 job 로그에 없다 (손상이 확인된 shard만 뺄 수 있다)")
+                raise ValueError(f"shard {sorted(no_proof)}가 손상됐거나 거기서 멈췄다는 증거가 이 job 로그에 없다 "
+                                 f"(손상 오류가 찍혔거나, 그 shard를 읽다가 멈춘 shard만 뺄 수 있다)")
             clean[key] = ",".join(map(str, new))
             continue
         try:
@@ -336,6 +339,54 @@ def _check_not_broken(ckpts: list[dict], step: int) -> None:
     if not math.isfinite(nxt) or (healthy and nxt > BROKEN_RATIO * min(healthy)):
         raise ValueError(f"step {step} 체크포인트 다음 loss가 {nxt_text} (그 전 최저 {min(healthy) if healthy else '?'}) "
                          f"→ 이미 망가진 체크포인트. 더 이른 step을 지정하라 (있는 것: {[c['step'] for c in ckpts]})")
+
+
+def is_stalled(job_id: str) -> bool:
+    """살아 있는데 "지금 실행 구간의 예상 로그 간격"의 10배 넘게 조용한가.
+
+    예상 간격 = max(지금 구간의 최근 로그 간격, 마지막 step_time × log_every).
+    전에는 전체 로그의 평소 간격만 봤다 → grad_accum을 늘려 재시작한 job은 step이 30배 느려지는데
+    예전의 빠른 간격과 비교해서 "멈춤"으로 오판했다 (troubleshooting_log 20번).
+    재시작 직후라 지금 구간에 로그가 아직 없으면 60초를 기다린다."""
+    s = summary(job_id, gpu_mem={})
+    if not s["alive"] or s["log_age_s"] is None:
+        return False
+    lines = tail(job_id, 100000)
+    starts = [i for i, l in enumerate(lines) if "Start training" in l]
+    seg = lines[starts[-1]:] if starts else lines
+    times = []
+    step_time = None
+    for line in seg:
+        if STEP_RE.search(line):
+            try:
+                times.append(datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp())
+            except ValueError:
+                pass
+            if (m := STEP_TIME_RE.search(line)):
+                step_time = float(m.group(1))
+    gaps = [b - a for a, b in zip(times, times[1:])][-6:]
+    expected = max(statistics.median(gaps) if gaps else 0.0,
+                   (step_time or 0.0) * int(read_config(job_id).get("log_every", 10)))
+    if not times or expected == 0:
+        return s["log_age_s"] > 60
+    return s["log_age_s"] > max(10 * expected, 30)
+
+
+def stall_shards(job_id: str) -> set[int]:
+    """"shard를 읽는다"는 줄을 마지막으로 멈춘 실행 구간의 shard 번호들.
+    지난 실행(재시작 전)이 그렇게 끝났거나, 지금 실행이 그 줄 뒤로 멈춰 있으면 증거로 본다."""
+    lines = tail(job_id, 100000)
+    starts = [i for i, l in enumerate(lines) if "Start training" in l] or [0]
+    out = set()
+    for n, a in enumerate(starts):
+        seg = lines[a:starts[n + 1]] if n + 1 < len(starts) else lines[a:]
+        # SIGTERM 경고와 다음 실행의 "Resumed ..."(Start training보다 먼저 찍힌다)는 빼고 본다
+        meaningful = [l for l in seg if l.strip() and "Received SIGTERM" not in l and "Resumed from" not in l]
+        if not meaningful or not (m := re.search(r"reading shard data/shard-(\d{4})", meaningful[-1])):
+            continue
+        if n + 1 < len(starts) or is_stalled(job_id):
+            out.add(int(m.group(1)))
+    return out
 
 
 def _without_flags(cmd: list[str], flags: set[str]) -> list[str]:

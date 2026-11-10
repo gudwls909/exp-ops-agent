@@ -1,7 +1,7 @@
 """
 MCP ops 서버 — week1 step3_docs_server.py와 같은 구조, 도구만 다르다
 
-Agent에게 주는 도구: 읽기 전용 6개 (list_jobs, job_status, tail_log, gpu_status, job_config, list_checkpoints)
+Agent에게 주는 도구: 읽기 전용 7개 (list_jobs, job_status, tail_log, gpu_status, job_config, list_checkpoints, find_runbooks)
   - 실행 도구(kill/restart)는 아예 없다
   - 승인 요청도 도구로 주지 않는다. Agent가 보고서에 쓴 조치를 "코드"가 승인 대기열에 넣는다 (agent/agent.py)
     이유: 도구로 줬더니 보고서엔 "terminate 요청"이라 쓰고 실제로는 도구를 안 부른 경우가 있었다 (말과 행동 불일치)
@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jobs  # noqa: E402
+import runbooks  # noqa: E402
 
 mcp = MCPServer("ops")
 MAX_TAIL = 200
@@ -93,6 +94,19 @@ def list_checkpoints(job_id: str) -> str:
     loss가 망가지기(nan/폭주) '전'의 체크포인트를 골라 재시작을 제안할 때 쓴다."""
     try:
         return _ok({"job_id": job_id, "checkpoints": jobs.checkpoints(job_id)})
+    except ValueError as e:
+        return _err(e)
+
+
+@mcp.tool()
+def find_runbooks(job_id: str) -> str:
+    """이 job의 장애와 비슷한 과거 장애에서 '실제로 실행해서 결과가 확인된' 조치 기록(runbook).
+    verified_successes(성공 횟수), failures(실패 횟수), recent(최근 사례: 무엇을 바꿨고 결과와 교훈)를 준다.
+    재시작/종료를 제안하기 전에 확인하라. 성공한 방법은 지금 job의 설정에 맞게 적용하고, 실패한 방법은 반복하지 마라.
+    결과가 비어 있으면 참고할 기록이 없는 것이다."""
+    try:
+        jobs.job_dir(job_id)
+        return _ok({"job_id": job_id, "signature": runbooks.signature(job_id), "runbooks": runbooks.find(job_id)})
     except ValueError as e:
         return _err(e)
 

@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(ROOT, "ops"))
 
 import approvals  # noqa: E402
 import jobs  # noqa: E402
+import runbooks  # noqa: E402
 
 MAX_REVISIONS = 1  # 검증에서 거부된 제안을 고쳐 쓸 기회
 
@@ -57,6 +58,10 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
      이 값이 정상이라고 해서 지금 진행 중이라는 뜻은 아니다.
 3. 필요하면 gpu_status, job_status를 쓴다.
 4. 재시작을 제안할 job은 job_config로 설정을 보고, list_checkpoints로 어느 체크포인트부터 다시 할지 고른다.
+5. 조치(terminate/restart)를 제안하기 전에 find_runbooks로 과거에 실제로 검증된 조치를 확인한다.
+   - 성공 기록이 있는 방법은 지금 job의 설정·로그에 맞게 적용한다 (숫자를 그대로 베끼지 말고 lesson의 관계를 적용)
+   - 실패 기록이 있는 방법(예: 같은 설정으로 재시작했더니 같은 자리에서 또 멈춤)은 반복하지 않는다
+   - 기록이 없거나 지금 장애와 맞지 않으면 무시하고 아래 정책대로 판단한다
 
 진단 종류 (diagnosis)
 - healthy              : 정상 진행 중
@@ -72,7 +77,9 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
 조치 정책 (보고서의 action_requested. 여기 적은 조치가 그대로 사람에게 승인 요청으로 간다)
 - restart는 "살아 있으면 먼저 종료한 뒤, changes로 설정을 바꿔 resume_from_step 체크포인트부터 다시 실행"이다.
   원인을 고치지 않고 그대로 재시작하면 같은 실패가 반복된다. 원인이 설정에 있으면 반드시 그 설정을 고쳐라.
-- hung             → restart. changes 없음 (일시적 멈춤이므로 같은 설정으로), resume_from_step은 null(마지막 체크포인트)
+- hung             → restart. 보통 일시적 멈춤이므로 changes 없음, resume_from_step은 null(마지막 체크포인트).
+                     단 이미 같은 설정으로 재시작했는데 같은 지점(예: 같은 shard를 읽다가)에서 또 멈췄다면,
+                     원인을 그 지점으로 보고 고친다 (예: 그 shard를 data_shards에서 빼기)
 - hung_at_shutdown → terminate (학습은 이미 끝났으므로 재시작 불필요)
 - nan_loss         → restart. 원인 설정(로그에서 loss가 망가진 시점에 바뀐 lr 등)을 job_config에서 찾아 안전한 값으로 낮춘다.
                      resume_from_step은 list_checkpoints에서 loss가 아직 정상이던 마지막 체크포인트 (망가진 뒤 저장된 것은 쓰지 마라)
@@ -207,6 +214,18 @@ def validation_errors(report: dict) -> dict:
             if j["action_requested"] == "restart":
                 changes = {k: v for k, v in (j.get("changes") or {}).items() if v is not None}
                 jobs.validate_changes(j["job_id"], changes, j.get("resume_from_step"))
+                # 메모리 기반 검사: 거의 같은 장애에서 "이 종류의 조치"가 여러 번 실패하고 한 번도 성공 못 했으면 거부
+                # (프롬프트로 "실패한 방법은 반복하지 마라"고 했지만, 정책 문장과 충돌하면 정책을 따랐다 → 21번)
+                kinds = sorted(changes) or ["(변경 없음)"]
+                for rb in runbooks.find(j["job_id"]):
+                    if rb["similarity"] >= 0.8 and rb["change_kinds"] == kinds and rb["failures"] >= 2 \
+                            and rb["verified_successes"] == 0:
+                        others = [b for b in runbooks.find(j["job_id"], k=5) if b["verified_successes"] > 0]
+                        hint = (f" 성공 기록이 있는 방법: {[(b['change_kinds'], b['recent'][-1]['lesson']) for b in others]}"
+                                if others else "")
+                        raise ValueError(f"거의 같은 장애(유사도 {rb['similarity']})에서 {kinds} 조치가 "
+                                         f"{rb['failures']}번 실패하고 한 번도 성공하지 못했다 (runbook {rb['runbook_id']})."
+                                         f"{hint}")
         except ValueError as e:
             if j["action_requested"] != "none":
                 errors[j["job_id"]] = str(e)
@@ -235,6 +254,8 @@ def file_requests(report: dict) -> list[dict]:
 
 
 async def run_once() -> dict:
+    # 순찰 전에, 지난번에 실행된 조치들의 결과를 확인해서 runbook에 기록한다 (성공이 확인된 것만 "검증된 조치"가 된다)
+    approvals.verify_outcomes()
     async with Client(ops_server()) as mcp:
         listed = await mcp.list_tools()
         tools = [{"type": "function",
