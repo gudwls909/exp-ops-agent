@@ -96,7 +96,7 @@ def main():
     # (실패 종류는 일부러 적지 않는다 → 위의 "주의" 참고. 다만 재실행 명령에는 --fail이 들어 있으니
     #  나중에 Agent에게 보여 줄 때는 명령줄을 가려야 한다 → 과제)
     with open(os.path.join(job_dir, "job.json"), "w") as f:
-        json.dump({"job_id": args.job_id, "pid": os.getpid(), "cmd": sys.argv,
+        json.dump({"job_id": args.job_id, "pid": os.getpid(), "python": sys.executable, "cmd": sys.argv,
                    "cwd": os.getcwd(), "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
 
     # SIGTERM(일반 kill)을 받으면 체크포인트를 저장하고 깔끔하게 끝낸다.

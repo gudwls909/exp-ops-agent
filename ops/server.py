@@ -1,0 +1,94 @@
+"""
+MCP ops 서버 — week1 step3_docs_server.py와 같은 구조, 도구만 다르다
+
+Agent에게 주는 도구
+  읽기: list_jobs, job_status, tail_log, gpu_status
+  요청: request_action  ← 승인 대기열에 "요청"만 넣는다. 실행 도구(kill/restart)는 아예 없다
+
+도구 결과는 JSON 문자열로 돌려준다 (LLM이 읽기 좋고, 평가 코드가 파싱하기도 좋다)
+stdio 서버이므로 print()는 금지. 로그는 stderr로 (week1에서 배운 것)
+"""
+
+import json
+import os
+import sys
+
+from mcp.server.mcpserver import MCPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import approvals  # noqa: E402
+import jobs  # noqa: E402
+
+mcp = MCPServer("ops")
+MAX_TAIL = 200
+
+
+def _ok(data) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _err(e: Exception) -> str:
+    # 잘못된 입력은 예외로 서버를 죽이지 않고, 이유를 LLM에게 돌려준다 (week1 step2의 도구 오류 처리와 같은 원칙)
+    return _ok({"error": str(e)})
+
+
+@mcp.tool()
+def list_jobs() -> str:
+    """모든 학습 job의 현재 상태 요약 목록. 먼저 이걸로 전체를 훑어본다.
+    각 항목: job_id, alive(프로세스 생존), log_age_s(로그가 마지막으로 바뀐 뒤 지난 초), last_step/total_steps, gpu_mem_mib"""
+    mem = jobs.gpu_mem_by_pid()  # nvidia-smi를 job마다 부르지 않고 한 번만
+    return _ok([jobs.summary(j, mem) for j in jobs.list_job_ids()])
+
+
+@mcp.tool()
+def job_status(job_id: str) -> str:
+    """job 하나의 상태 요약 (list_jobs의 한 항목과 같은 내용)."""
+    try:
+        return _ok(jobs.summary(job_id))
+    except ValueError as e:
+        return _err(e)
+
+
+@mcp.tool()
+def tail_log(job_id: str, n: int = 30) -> str:
+    """job의 학습 로그(train.log) 마지막 n줄. 최대 200줄. 원인 진단에 쓴다 (traceback, loss 값, 마지막 메시지 등)."""
+    try:
+        n = max(1, min(int(n), MAX_TAIL))
+        return _ok({"job_id": job_id, "lines": jobs.tail(job_id, n)})
+    except ValueError as e:
+        return _err(e)
+
+
+@mcp.tool()
+def gpu_status() -> str:
+    """GPU별 사용률(%)과 메모리 사용량. 그리고 GPU 메모리를 쓰고 있는 job (pid → job_id)."""
+    mem = jobs.gpu_mem_by_pid()
+    pid_to_job = {}
+    for j in jobs.list_job_ids():
+        pid = jobs.read_job(j)["pid"]
+        if pid in mem and jobs.is_alive(pid, j):
+            pid_to_job[pid] = j
+    return _ok({
+        "gpus": jobs.gpus(),
+        "processes": [{"pid": p, "mem_mib": m, "job_id": pid_to_job.get(p)} for p, m in mem.items()],
+    })
+
+
+@mcp.tool()
+def request_action(job_id: str, action: str, reason: str) -> str:
+    """job을 종료(terminate)하거나 재시작(restart)해 달라고 사람에게 '승인 요청'을 보낸다.
+    이 도구는 실행하지 않는다. 사람이 승인해야 실행된다.
+    action: "terminate"(멈춘/망가진 job 종료) 또는 "restart"(종료된 job을 마지막 체크포인트부터 재시작)
+    reason: 사람이 승인 여부를 판단할 수 있게, 근거(로그 내용, 수치)를 포함한 진단을 한두 문장으로."""
+    try:
+        item = approvals.request(job_id, action, reason)
+        return _ok({"approval_id": item["id"], "status": item["status"],
+                    "message": "승인 요청을 보냈습니다. 사람이 승인하기 전에는 실행되지 않습니다."})
+    except ValueError as e:
+        return _err(e)
+
+
+if __name__ == "__main__":
+    print("ops MCP 서버 시작 (stdio)", file=sys.stderr)
+    mcp.run()
