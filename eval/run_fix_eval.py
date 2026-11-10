@@ -19,6 +19,7 @@ run_eval.py(감지 평가)와 다른 점
 실행 (프로젝트 루트에서):
   python eval/run_fix_eval.py              # 1회 = Agent 1번 + 그냥 재시작 1번 (약 8분, Agent 비용 약 $0.02)
   python eval/run_fix_eval.py --repeat 2
+  python eval/run_fix_eval.py --set heldout --repeat 2   # 개발 중에 보지 않은 조건
 """
 
 import argparse
@@ -69,23 +70,69 @@ def ok_hang(ch, resume):
     return ch == {}
 
 
-SCENARIO = [
-    {"name": "diverge", "args": ["--steps", "1500", "--stage2-at", "150", "--stage2-lr", "1e3"], "check": ok_diverge},
-    {"name": "oom", "args": ["--steps", "150", "--stage2-at", "120", "--stage2-batch", "524288"], "check": ok_oom},
-    {"name": "bad_shard", "args": ["--steps", "300", "--bad-shards", "3"], "check": ok_shard},
-    {"name": "hang", "args": ["--steps", "300", "--fail", "hang", "--fail-at", "70"], "check": ok_hang},
-    {"name": "healthy", "args": ["--steps", "8000"], "check": None},  # 건드리면 안 됨
-]
+# ---- held-out용 기준 (숫자가 다르다) ----
+def ok_diverge_h(ch, resume):
+    return set(ch) <= {"stage2_lr", "max_lr", "warmup_steps"} and (ch.get("stage2_lr") or 1) <= 1e-2 \
+        and resume is not None and resume < 250
 
 
-def launch(runs_dir, gpu):
+def ok_shard_h(ch, resume):
+    return set(ch) == {"data_shards"} and ch["data_shards"] == "0,1,2,3,4"
+
+
+def ok_oom_h(ch, resume):
+    # grad_accum 2로는 여전히 OOM이 난다(직접 측정). 3 이상이어야 실제로 돈다 → "수정 성공"에서 걸러짐
+    return set(ch) == {"grad_accum"} and ch["grad_accum"] >= 2
+
+
+# kind: restart(고쳐서 재시작해야 함) / terminate(종료만 해야 함) / safe(건드리면 안 됨)
+SETS = {
+    "dev": [  # 개발하면서 보고 4번 고친 시나리오
+        {"name": "diverge", "kind": "restart", "check": ok_diverge,
+         "args": COMMON + ["--steps", "1500", "--stage2-at", "150", "--stage2-lr", "1e3"]},
+        {"name": "oom", "kind": "restart", "check": ok_oom,
+         "args": COMMON + ["--steps", "150", "--stage2-at", "120", "--stage2-batch", "524288"]},
+        {"name": "bad_shard", "kind": "restart", "check": ok_shard,
+         "args": COMMON + ["--steps", "300", "--bad-shards", "3"]},
+        {"name": "hang", "kind": "restart", "check": ok_hang,
+         "args": COMMON + ["--steps", "300", "--fail", "hang", "--fail-at", "70"]},
+        {"name": "healthy", "kind": "safe", "check": None, "args": COMMON + ["--steps", "8000"]},
+    ],
+    # held-out: 한 번도 돌려 보지 않은 조건. ⚠️ 이 결과를 보고 고치면 안 된다
+    #   다른 점: 숫자(lr, batch, 시점), 학습 속도, 체크포인트 간격, shard 구성, grad_accum 2로는 부족한 OOM,
+    #   그리고 새 유형 2개: "종료만 해야 하는 job"(hang_at_shutdown), "건드리면 안 되는 느린 job"
+    "heldout": [
+        {"name": "diverge_h", "kind": "restart", "check": ok_diverge_h,
+         "args": ["--step-time", "0.02", "--ckpt-every", "40", "--steps", "3000", "--stage2-at", "250",
+                  "--stage2-lr", "5e2"]},
+        {"name": "oom_h", "kind": "restart", "check": ok_oom_h,
+         "args": ["--step-time", "0.03", "--ckpt-every", "40", "--steps", "110", "--batch-size", "512",
+                  "--stage2-at", "90", "--stage2-batch", "786432"]},
+        {"name": "shard_h", "kind": "restart", "check": ok_shard_h,
+         "args": ["--step-time", "0.03", "--ckpt-every", "40", "--steps", "400", "--data-shards", "0,1,2,3,4,5",
+                  "--shard-steps", "30", "--bad-shards", "5"]},
+        {"name": "hang_h", "kind": "restart", "check": ok_hang,
+         "args": ["--step-time", "0.2", "--log-every", "5", "--ckpt-every", "40", "--steps", "250",
+                  "--fail", "hang", "--fail-at", "60"]},
+        {"name": "shutdown_h", "kind": "terminate", "check": None,
+         "args": ["--step-time", "0.1", "--ckpt-every", "40", "--steps", "80", "--fail", "hang_at_shutdown"]},
+        {"name": "slow_h", "kind": "safe", "check": None,
+         "args": ["--step-time", "0.1", "--ckpt-every", "50", "--steps", "5000", "--fail", "slow",
+                  "--fail-at", "30", "--slow-factor", "10"]},
+        {"name": "healthy_h", "kind": "safe", "check": None,
+         "args": ["--step-time", "0.05", "--ckpt-every", "50", "--steps", "8000"]},
+    ],
+}
+
+
+def launch(runs_dir, gpu, scenario):
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # 끝난 job 자동 회수 (run_eval.py와 같은 이유)
     truth = {}
-    for spec in random.sample(SCENARIO, len(SCENARIO)):
+    for spec in random.sample(scenario, len(scenario)):
         job_id = f"run-{random.randrange(16 ** 4):04x}"
         truth[job_id] = spec
         cmd = [sys.executable, os.path.join(ROOT, "sim", "fake_train.py"), "--job-id", job_id, "--gpu", str(gpu),
-               "--runs-dir", runs_dir] + COMMON + spec["args"]
+               "--runs-dir", runs_dir] + spec["args"]
         subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return truth
 
@@ -127,9 +174,9 @@ def kill_all(jobs_mod, truth):
             pass
 
 
-async def run_one(idx, gpu, method):
+async def run_one(idx, gpu, method, set_name):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    runs_dir = os.path.join(EVAL_DIR, "runs", f"fix_{stamp}_{idx}_{method}")
+    runs_dir = os.path.join(EVAL_DIR, "runs", f"fix_{set_name}_{stamp}_{idx}_{method}")
     os.environ["OPS_RUNS_DIR"] = runs_dir
     os.environ["OPS_STATE_DIR"] = os.path.join(runs_dir, "_state")
     import agent
@@ -137,7 +184,7 @@ async def run_one(idx, gpu, method):
     import jobs as jobs_mod
     jobs_mod.RUNS_DIR, approvals.STATE_DIR = runs_dir, os.environ["OPS_STATE_DIR"]
 
-    truth = launch(runs_dir, gpu)
+    truth = launch(runs_dir, gpu, SETS[set_name])
     print(f"[{idx}/{method}] job {len(truth)}개 실행, {WAIT_S}초 대기...", file=sys.stderr)
     time.sleep(WAIT_S)
     result = {"method": method, "truth": {j: t["name"] for j, t in truth.items()}, "jobs": {}}
@@ -154,10 +201,14 @@ async def run_one(idx, gpu, method):
             proposals = {it["job_id"]: it for it in approvals._load()}
         else:
             # 그냥 재시작: 실패 job(정상 job 제외)을 설정 변경 없이 마지막 체크포인트부터
+            #   (검증기가 "망가진 체크포인트"라며 거부하면 재시작을 못 한 것으로 남는다)
             proposals = {}
             for j, t in truth.items():
-                if t["name"] != "healthy":
-                    proposals[j] = approvals.request(j, "restart", "plain restart")
+                if t["kind"] != "safe":
+                    try:
+                        proposals[j] = approvals.request(j, "restart", "plain restart")
+                    except ValueError:
+                        pass
 
         # 전부 승인 (검토 없이) → 실제로 실행
         relaunched = []
@@ -167,14 +218,18 @@ async def run_one(idx, gpu, method):
                 relaunched.append(j)
         print(f"[{idx}/{method}] 승인·재시작 {len(relaunched)}개, 완료 대기...", file=sys.stderr)
         time.sleep(8)  # 재시작된 프로세스가 job.json에 새 pid를 쓸 시간 (안 기다리면 옛 pid를 보고 "끝났다"고 착각)
-        wait_finished(jobs_mod, [j for j in relaunched if truth[j]["name"] != "healthy"])
+        wait_finished(jobs_mod, [j for j in relaunched if truth[j]["kind"] != "safe"])
 
         for j, t in truth.items():
             p = proposals.get(j)
             row = {"scenario": t["name"], "action": p["action"] if p else "none",
                    "changes": p.get("changes") if p else None, "resume_from": p.get("resume_from") if p else None}
-            if t["check"] is None:
+            if t["kind"] == "safe":
                 row["touched"] = p is not None
+            elif t["kind"] == "terminate":
+                # 학습은 이미 끝났다 → 종료만 하면 됨. 재시작하면 같은 자리에서 또 멈춘다
+                row["outcome"] = {"completed": bool(p) and p["action"] == "terminate"}
+                row["semantic_ok"] = row["good_fix"] = row["outcome"]["completed"]
             else:
                 row["outcome"] = outcome(jobs_mod, j) if p and p["action"] == "restart" else {"completed": False}
                 row["semantic_ok"] = bool(p) and p["action"] == "restart" and t["check"](p.get("changes") or {},
@@ -186,8 +241,9 @@ async def run_one(idx, gpu, method):
     return result
 
 
-def summarize(results):
-    names = [s["name"] for s in SCENARIO if s["check"] is not None]
+def summarize(results, set_name):
+    names = [s["name"] for s in SETS[set_name] if s["kind"] != "safe"]
+    safe_names = {s["name"] for s in SETS[set_name] if s["kind"] == "safe"}
     for method in ("agent", "plain_restart"):
         rs = [r for r in results if r["method"] == method]
         if not rs:
@@ -206,7 +262,8 @@ def summarize(results):
             print(f"{name:<12}{f'{c}/{len(rows)}':>10}{f'{s}/{len(rows)}':>10}{f'{g}/{len(rows)}':>10}   {props}")
         touched = sum(row.get("touched", False) for r in rs for row in r["jobs"].values())
         c, s_, g = (f"{tot[k]}/{tot['n']}" for k in ("c", "s", "g"))
-        print(f"{'합계':<12}{c:>10}{s_:>10}{g:>10}   정상 job 건드림: {touched}/{len(rs)}")
+        n_safe = sum(row["scenario"] in safe_names for r in rs for row in r["jobs"].values())
+        print(f"{'합계':<12}{c:>10}{s_:>10}{g:>10}   정상 job 건드림: {touched}/{n_safe}")
         if method == "agent":
             print(f"비용/순찰 ${sum(r['cost_usd'] for r in rs) / len(rs):.4f}, 시간/순찰 "
                   f"{sum(r['latency_s'] for r in rs) / len(rs):.0f}s")
@@ -217,18 +274,19 @@ async def main():
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--gpu", type=int, default=1)
     p.add_argument("--skip-baseline", action="store_true")
+    p.add_argument("--set", choices=list(SETS), default="dev")
     args = p.parse_args()
 
     results = []
     for i in range(args.repeat):
-        results.append(await run_one(i, args.gpu, "agent"))
+        results.append(await run_one(i, args.gpu, "agent", args.set))
         if not args.skip_baseline:
-            results.append(await run_one(i, args.gpu, "plain_restart"))
-    summarize(results)
+            results.append(await run_one(i, args.gpu, "plain_restart", args.set))
+    summarize(results, args.set)
 
     out_dir = os.path.join(EVAL_DIR, "results")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + "_fix.json")
+    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + f"_fix_{args.set}.json")
     with open(out, "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=2, default=str)
     print(f"\n자세한 결과: {out}")

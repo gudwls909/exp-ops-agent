@@ -15,6 +15,7 @@ week1 step3_agent.py / step5_api.py의 run_agent와 같은 루프다. 달라진 
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 
@@ -179,12 +180,30 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
     return {"report": {"jobs": []}, "trace": trace, "error": "MAX_STEPS 초과"}
 
 
+# 근거 대조에 쓰는 "고유한 증거" 토큰: 예외 이름(KeyError, OutOfMemoryError...)과 shard 파일 이름
+EVIDENCE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z]*Error\b|shard-\d{4}")
+
+
+def grounding_error(job_id: str, evidence: str):
+    """보고서 근거에 인용한 예외 이름·shard 이름이 그 job의 로그에 실제로 있는지 확인한다.
+    없으면 다른 job의 진단을 베꼈을 가능성 (troubleshooting_log 16번). 이유 문자열을 돌려주고, 문제없으면 None."""
+    log = "\n".join(jobs.tail(job_id, 100000))
+    missing = sorted({t for t in EVIDENCE_TOKEN_RE.findall(evidence) if t not in log})
+    if missing:
+        return (f"근거에 인용한 {missing}이(가) 이 job({job_id})의 로그에 없다. 다른 job과 혼동했는지 "
+                f"tail_log로 이 job의 로그를 다시 확인하라")
+    return None
+
+
 def validation_errors(report: dict) -> dict:
-    """대기열에 넣지 않고 검증만. {job_id: 거부 이유}"""
+    """대기열에 넣지 않고 검증만. {job_id: 거부 이유}
+    1) 근거 대조: 인용한 오류가 그 job 로그에 실제로 있나  2) 제안 검증: 허용 목록·범위·체크포인트 상태"""
     errors = {}
     for j in report["jobs"]:
         try:
             jobs.job_dir(j["job_id"])
+            if j["action_requested"] != "none" and (g := grounding_error(j["job_id"], j.get("evidence", ""))):
+                raise ValueError(g)
             if j["action_requested"] == "restart":
                 changes = {k: v for k, v in (j.get("changes") or {}).items() if v is not None}
                 jobs.validate_changes(j["job_id"], changes, j.get("resume_from_step"))
@@ -201,6 +220,8 @@ def file_requests(report: dict) -> list[dict]:
         if j["action_requested"] == "none":
             continue
         try:
+            if (g := grounding_error(j["job_id"], j.get("evidence", ""))):  # 고쳐 쓴 뒤에도 근거가 안 맞으면 요청하지 않는다
+                raise ValueError(g)
             extra = {}
             if j["action_requested"] == "restart":
                 extra = {"changes": {k: v for k, v in (j.get("changes") or {}).items() if v is not None},

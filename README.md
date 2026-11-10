@@ -26,7 +26,7 @@ ops/approvals.py (승인 대기열) ◀── 사람: ops/approve.py ──▶ t
 ```bash
 python eval/run_eval.py --repeat 3                 # dev: 실패 8종 job을 실제 GPU에서 띄우고 Agent와 규칙 비교
 python eval/run_eval.py --set heldout --repeat 3   # held-out: 개발 중에 보지 않은 조건
-pytest                               # 안전장치·파싱 테스트 23개
+pytest                               # 안전장치·파싱·검증 테스트 41개
 ```
 
 - 실패 주입 시뮬레이터가 8종 job(정상, 완료, 느리지만 정상, hang, 종료 시 hang, crash, OOM, NaN)을 **랜덤 id**로 띄운다. 정답은 평가 스크립트만 안다.
@@ -76,7 +76,21 @@ python eval/run_fix_eval.py --repeat 2
 | 3 | 거부 사유를 Agent에게 돌려주고 한 번 고쳐 쓰게 | 5/8 — 고쳐 쓰면서 batch를 줄임 (실험 변경) |
 | 4 | batch 변경 금지·망가진 체크포인트 거부를 **검증 코드로 강제** | **7/8** — 남은 1개는 다른 job의 진단을 베낀 혼동 |
 
-⚠️ 같은 시나리오를 보고 4번 고친 **dev 점수**다. 수정 평가용 held-out은 아직 없다.
+⚠️ 위는 같은 시나리오를 보고 4번 고친 **dev 점수**다.
+
+**수정 held-out** (개발 중 한 번도 돌리지 않은 7개 job: 다른 숫자·속도·체크포인트 간격·shard 구성, grad_accum 2로는 부족한 OOM, 종료만 해야 하는 job, 건드리면 안 되는 느린 job. 결과를 보고 Agent를 고치지 않음)
+
+```bash
+python eval/run_fix_eval.py --set heldout --repeat 2
+```
+
+| 방법 | 좋은 수정 | 설정이 원인인 실패 (발산·OOM·shard) | 정상 job 건드림 |
+|---|---|---|---|
+| **Agent** | **8/10** | **6/6** | 0/4 |
+| 그냥 재시작 | 2/10 | 0/6 | 0/4 |
+
+Agent가 틀린 2개는 "살아 있는데 오래 조용한 job"을 healthy/finished로 본 것 (근거에는 13배 침묵을 적어 놓고 결론은 정상).
+분석과 고칠 방향: [docs/troubleshooting_log.md](docs/troubleshooting_log.md) 17~19번
 
 평가로 찾아서 고친 것
 
@@ -105,6 +119,7 @@ python eval/run_fix_eval.py --repeat 2
 - [x] held-out 시나리오 평가
 - [ ] 실제 로그 재생
 - [x] 원인을 고친 재시작 제안 + 수정 평가 (수정 성공 + 의미 보존)
-- [ ] 근거 대조(보고서에 인용한 오류가 그 job 로그에 실제로 있나), 수정 평가 held-out
+- [x] 근거 대조(보고서에 인용한 오류가 그 job 로그에 실제로 있나), 수정 평가 held-out
+- [ ] 일관성 검사(살아 있는데 오래 조용한 job을 정상으로 보고하면 거부) + 새 held-out
 - [ ] 검증된 조치를 runbook skill로 저장·재사용 (memory) + ablation
 - [ ] FastAPI 승인 API, Docker

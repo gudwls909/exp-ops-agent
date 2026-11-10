@@ -263,3 +263,37 @@ def test_broken_checkpoint_rejected(env, tmp_path):
     with pytest.raises(ValueError, match="망가진"):
         approvals.request("j1", "restart", "x", changes={"stage2_lr": 1e-3})  # 지정 안 하면 마지막(150) → 거부
     assert approvals.request("j1", "restart", "x", changes={"stage2_lr": 1e-3}, resume_from=100)["resume_from"] == 100
+
+
+# ---------------- 10. 근거 대조: 다른 job의 진단을 베끼면 거부 ----------------
+def test_grounding_rejects_evidence_not_in_this_log(env, tmp_path):
+    import agent
+    env("oomjob")
+    d = _job_with_config(tmp_path, "oomjob")
+    (d / "train.log").write_text("2026-11-10 12:00:00 INFO step 10/100 loss 0.5\n"
+                                 "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.00 GiB\n")
+    copied = 'KeyError "\'label\' missing (corrupted shard data/shard-0003.tar)"'   # 다른 job의 로그 내용
+    assert "KeyError" in agent.grounding_error("oomjob", copied)
+    assert agent.grounding_error("oomjob", "torch.OutOfMemoryError 발생") is None
+
+
+def test_shard_removal_needs_proof_in_log(env, tmp_path):
+    env("j1")
+    d = _job_with_config(tmp_path, "j1")
+    (d / "train.log").write_text("2026-11-10 12:00:00 INFO step 10/100 loss 0.5\n")
+    with pytest.raises(ValueError, match="증거"):
+        approvals.request("j1", "restart", "x", changes={"data_shards": "0,1,2"})  # shard 3 손상 증거 없음
+    with open(d / "train.log", "a") as f:
+        f.write("KeyError: \"'label' missing in sample index 3879 (corrupted shard data/shard-0003.tar)\"\n")
+    assert approvals.request("j1", "restart", "x", changes={"data_shards": "0,1,2"})["changes"] == {"data_shards": "0,1,2"}
+
+
+# ---------------- 11. 승인한 것 = 실행되는 것, 실행 불가면 죽지 않고 failed ----------------
+def test_restart_pins_checkpoint_and_fails_gracefully(env, tmp_path):
+    env("j1")
+    d = _job_with_config(tmp_path, "j1", ckpt_steps=(20,))
+    item = approvals.request("j1", "restart", "x")
+    assert item["resume_from"] == 20                     # "마지막"을 요청 시점의 step으로 고정
+    (d / "ckpt-000020.pt").unlink()                       # 승인 대기 중에 상황이 바뀜 (체크포인트가 사라짐)
+    done = approvals.decide(item["id"], approve=True)
+    assert done["status"] == "failed" and "검증 실패" in done["result"]

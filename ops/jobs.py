@@ -285,6 +285,11 @@ def validate_changes(job_id: str, changes: dict | None, resume_from: int | None)
             old = [int(x) for x in str(config.get("data_shards", "")).split(",") if x.strip() != ""]
             if not new or not set(new) <= set(old):
                 raise ValueError(f"data_shards는 기존 shard {old}에서 빼는 것만 가능: {new}")
+            # 데이터를 빼는 건 실험을 바꾸는 일 → 이 job의 로그에 "그 shard가 손상됐다"는 증거가 있을 때만 허용
+            log = "\n".join(tail(job_id, 100000))
+            no_proof = [k for k in set(old) - set(new) if f"corrupted shard data/shard-{k:04d}" not in log]
+            if no_proof:
+                raise ValueError(f"shard {sorted(no_proof)}가 손상됐다는 증거가 이 job 로그에 없다 (손상이 확인된 shard만 뺄 수 있다)")
             clean[key] = ",".join(map(str, new))
             continue
         try:

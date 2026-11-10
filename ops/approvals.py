@@ -52,6 +52,12 @@ def request(job_id: str, action: str, reason: str, changes: dict | None = None,
         raise ValueError(f"지원하지 않는 action: {action!r} (가능: {sorted(ACTIONS)})")
     if action == "restart":
         changes, resume_from = jobs.validate_changes(job_id, changes, resume_from)
+        # "마지막 체크포인트"를 요청 시점의 구체적인 step으로 고정한다.
+        # 승인을 기다리는 동안 job이 계속 돌며 새 체크포인트(망가진 것일 수도)를 쓰면,
+        # 사람이 승인한 계획과 실제로 실행되는 계획이 달라진다 → "승인한 것 = 실행되는 것"
+        if resume_from is None:
+            steps = [c["step"] for c in jobs.checkpoints(job_id)]
+            resume_from = steps[-1] if steps else None
     elif changes or resume_from is not None:
         raise ValueError("changes/resume_from은 restart에서만 쓸 수 있다")
     items = _load()
@@ -88,11 +94,17 @@ def decide(approval_id: int, approve: bool, decided_by: str = "human") -> dict:
         raise ValueError(f"이미 처리된 요청: {approval_id} ({item['status']})")
 
     if approve:
-        if item["action"] == "terminate":
-            item["result"] = jobs.terminate(item["job_id"])
-        else:
-            item["result"] = jobs.restart(item["job_id"], item.get("changes"), item.get("resume_from"))
-        item["status"] = "executed"
+        # 실행 직전에 한 번 더 검증된다 (jobs.restart 안에서). 그 사이 상황이 바뀌어 실행할 수 없으면
+        # 프로그램이 죽지 않고 "failed"와 이유를 남긴다 (평가 도중 실제로 죽었던 버그)
+        try:
+            if item["action"] == "terminate":
+                item["result"] = jobs.terminate(item["job_id"])
+            else:
+                item["result"] = jobs.restart(item["job_id"], item.get("changes"), item.get("resume_from"))
+            item["status"] = "executed"
+        except ValueError as e:
+            item["result"] = f"실행 직전 검증 실패: {e}"
+            item["status"] = "failed"
     else:
         item["status"] = "rejected"
     item["decided_by"] = decided_by

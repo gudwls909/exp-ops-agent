@@ -168,6 +168,10 @@ def main():
         log.info(f"Resumed from checkpoint at step {start}")
         if args.fail != "none" and fail_at <= start:
             fail_at = args.steps + 1  # 이미 지난 실패 지점은 다시 일으키지 않는다 (재시작 성공 시나리오)
+        if args.fail == "hang":
+            # hang은 "일시적" 장애를 흉내 낸다 (데드락, 네트워크 파일시스템 멈춤 등). 재시작하면 다시 안 생긴다.
+            # 이전 체크포인트(실패 지점 이전)부터 재시작해도 같은 step에서 또 멈추면 안 된다 (troubleshooting_log 18번)
+            fail_at = args.steps + 1
 
     log.info(f"Start training job={args.job_id} device={device} steps={args.steps} pid={os.getpid()}")
 
