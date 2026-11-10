@@ -9,3 +9,6 @@ real_logs/
 .claude/
 # 승인 대기열 등 실행 상태
 state/
+# 평가 실행 중 생기는 job 폴더와 결과
+eval/runs/
+eval/results/

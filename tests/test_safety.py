@@ -79,7 +79,7 @@ def test_mcp_exposes_no_execute_tools():
             return {t.name for t in (await c.list_tools()).tools}
 
     tools = asyncio.run(names())
-    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status", "request_action"}
+    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status"}  # 읽기 전용만. 요청도 도구가 아님
     # 혹시 누가 실행 도구를 추가하면 이 테스트가 깨진다 → 리뷰에서 "왜 추가했나" 논의하게 된다
 
 
@@ -155,3 +155,17 @@ def test_agent_view_has_no_answer(env):
     import server
     for out in (server.list_jobs(), server.job_status("j1"), server.tail_log("j1")):
         assert "--fail" not in out and "hang" not in out and '"cmd"' not in out
+
+
+# ---------------- 7. 보고서(말) → 승인 대기열(행동)은 코드가 옮긴다 ----------------
+def test_report_actions_are_filed_by_code(env):
+    import agent
+    env("j1"); env("j2")
+    report = {"jobs": [
+        {"job_id": "j1", "diagnosis": "hung", "evidence": "25배 지연", "action_requested": "terminate", "recommendation": ""},
+        {"job_id": "j2", "diagnosis": "healthy", "evidence": "정상", "action_requested": "none", "recommendation": ""},
+        {"job_id": "ghost", "diagnosis": "hung", "evidence": "지어낸 job", "action_requested": "terminate", "recommendation": ""},
+    ]}
+    filed = agent.file_requests(report)
+    assert [it["job_id"] for it in approvals.pending()] == ["j1"]   # 요청한 것만, 정확히 하나
+    assert "error" in next(f for f in filed if f["job_id"] == "ghost")  # 없는 job은 거부 (지어낸 id)

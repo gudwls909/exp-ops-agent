@@ -1,9 +1,10 @@
 """
 MCP ops 서버 — week1 step3_docs_server.py와 같은 구조, 도구만 다르다
 
-Agent에게 주는 도구
-  읽기: list_jobs, job_status, tail_log, gpu_status
-  요청: request_action  ← 승인 대기열에 "요청"만 넣는다. 실행 도구(kill/restart)는 아예 없다
+Agent에게 주는 도구: 읽기 전용 4개 (list_jobs, job_status, tail_log, gpu_status)
+  - 실행 도구(kill/restart)는 아예 없다
+  - 승인 요청도 도구로 주지 않는다. Agent가 보고서에 쓴 조치를 "코드"가 승인 대기열에 넣는다 (agent/agent.py)
+    이유: 도구로 줬더니 보고서엔 "terminate 요청"이라 쓰고 실제로는 도구를 안 부른 경우가 있었다 (말과 행동 불일치)
 
 도구 결과는 JSON 문자열로 돌려준다 (LLM이 읽기 좋고, 평가 코드가 파싱하기도 좋다)
 stdio 서버이므로 print()는 금지. 로그는 stderr로 (week1에서 배운 것)
@@ -17,7 +18,6 @@ from mcp.server.mcpserver import MCPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import approvals  # noqa: E402
 import jobs  # noqa: E402
 
 mcp = MCPServer("ops")
@@ -73,20 +73,6 @@ def gpu_status() -> str:
         "gpus": jobs.gpus(),
         "processes": [{"pid": p, "mem_mib": m, "job_id": pid_to_job.get(p)} for p, m in mem.items()],
     })
-
-
-@mcp.tool()
-def request_action(job_id: str, action: str, reason: str) -> str:
-    """job을 종료(terminate)하거나 재시작(restart)해 달라고 사람에게 '승인 요청'을 보낸다.
-    이 도구는 실행하지 않는다. 사람이 승인해야 실행된다.
-    action: "terminate"(멈춘/망가진 job 종료) 또는 "restart"(종료된 job을 마지막 체크포인트부터 재시작)
-    reason: 사람이 승인 여부를 판단할 수 있게, 근거(로그 내용, 수치)를 포함한 진단을 한두 문장으로."""
-    try:
-        item = approvals.request(job_id, action, reason)
-        return _ok({"approval_id": item["id"], "status": item["status"],
-                    "message": "승인 요청을 보냈습니다. 사람이 승인하기 전에는 실행되지 않습니다."})
-    except ValueError as e:
-        return _err(e)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,10 @@ import json
 import os
 import re
 import signal
+import statistics
 import subprocess
 import time
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 테스트에서는 환경변수로 임시 폴더를 가리키게 한다 (week1 db.py의 DB_PATH와 같은 방식)
@@ -25,6 +27,9 @@ RUNS_DIR = os.getenv("OPS_RUNS_DIR", os.path.join(ROOT, "runs"))
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STEP_RE = re.compile(r"step (\d+)/(\d+)")
+# 로그 한 줄 예: "... INFO step 230/300 loss 0.01574 lr 1.0e-03 gpu_mem 97MiB step_time 0.10s"
+LOSS_RE = re.compile(r"loss (\S+)")                    # \S+ : 공백이 아닌 글자 1개 이상 → "0.01574", "nan", "inf" 모두
+STEP_TIME_RE = re.compile(r"step_time (\d+\.?\d*)s")   # 숫자, (점 있을 수도), 숫자 0개 이상, 그리고 글자 s
 
 
 # ---------------------------------------------------------------
@@ -110,6 +115,40 @@ def last_step(job_id: str):
     return None, None
 
 
+def last_metrics(job_id: str):
+    """로그에서 마지막 loss(문자열)와 step_time(초)을 찾는다. 없으면 None.
+    loss를 숫자로 바꾸지 않는 이유: float("nan")은 JSON 표준에 없어서 json.dumps가 NaN이라는 비표준 글자를 쓴다.
+    로그에 찍힌 글자 그대로("nan") 넘기는 게 LLM에게도 파서에게도 안전하다."""
+    loss = step_time = None
+    for line in reversed(tail(job_id, 500)):
+        if loss is None and (m := LOSS_RE.search(line)):
+            loss = m.group(1)
+        if step_time is None and (m := STEP_TIME_RE.search(line)):
+            step_time = float(m.group(1))
+        if loss is not None and step_time is not None:
+            break
+    return loss, step_time
+
+
+def recent_log_interval(job_id: str, k: int = 6):
+    """최근 step 로그 줄들 사이의 '평소 간격'(초, 중앙값). 계산할 수 없으면 None.
+    log_age만으로는 "26초가 긴가?"를 알 수 없다. 1초마다 쓰던 job이면 26배 지연(멈춤)이고,
+    20초마다 쓰던 job이면 정상이다. 그 job 자신의 속도와 비교해야 한다."""
+    times = []
+    for line in reversed(tail(job_id, 500)):
+        if STEP_RE.search(line):
+            try:
+                times.append(datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp())
+            except ValueError:
+                continue
+            if len(times) > k:
+                break
+    gaps = [a - b for a, b in zip(times, times[1:])]
+    if not gaps:
+        return None
+    return max(statistics.median(gaps), 1.0)  # 로그 시각이 초 단위라 1초보다 작게는 못 잰다
+
+
 # ---------------------------------------------------------------
 # GPU
 # ---------------------------------------------------------------
@@ -140,6 +179,8 @@ def summary(job_id: str, gpu_mem: dict | None = None) -> dict:
     job = read_job(job_id)
     pid = job["pid"]
     step, total = last_step(job_id)
+    loss, step_time = last_metrics(job_id)
+    interval = recent_log_interval(job_id)
     gpu_mem = gpu_mem_by_pid() if gpu_mem is None else gpu_mem
     age = log_age(job_id)
     return {
@@ -150,6 +191,11 @@ def summary(job_id: str, gpu_mem: dict | None = None) -> dict:
         "log_age_s": None if age == float("inf") else round(age, 1),
         "last_step": step,
         "total_steps": total,
+        "last_loss": loss,
+        "last_step_time_s": step_time,
+        "recent_log_interval_s": interval,
+        # 로그가 평소 간격의 몇 배만큼 조용한가. 1~2면 정상 범위, 수십이면 멈췄을 가능성이 크다
+        "log_age_vs_interval": None if (interval is None or age == float("inf")) else round(age / interval, 1),
         "gpu_mem_mib": gpu_mem.get(pid),
     }
 

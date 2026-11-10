@@ -8,7 +8,8 @@ week1 step3_agent.py / step5_api.py의 run_agent와 같은 루프다. 달라진 
 3. 한 번의 순찰에 도구를 여러 번 부른다 (job 여러 개 × 상태 확인/로그 확인) → MAX_STEPS를 넉넉히
 
 실행:
-  python agent/agent.py            # 순찰 1회 → 보고서 출력. 승인 요청은 python ops/approve.py 로 확인
+  python agent/agent.py            # 순찰 1회 → 보고서 출력 + 보고서의 조치를 승인 대기열에 등록
+  python ops/approve.py            # 대기 중인 승인 요청 확인/승인
 """
 
 import asyncio
@@ -23,11 +24,19 @@ from openai import AsyncOpenAI
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(ROOT, ".env"))
+sys.path.insert(0, os.path.join(ROOT, "ops"))
+
+import approvals  # noqa: E402
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 MAX_STEPS = 15
-OPS_SERVER = StdioServerParameters(command=sys.executable, args=[os.path.join(ROOT, "ops", "server.py")],
-                                   env={**os.environ})  # OPS_RUNS_DIR 같은 설정을 서버에도 넘긴다 (평가 때 사용)
+
+
+def ops_server() -> StdioServerParameters:
+    # 함수로 만든 이유: import할 때 한 번 만들어 두면 그 순간의 환경변수(OPS_RUNS_DIR)가 고정된다.
+    # 평가처럼 한 프로세스에서 여러 번 돌릴 때, 두 번째부터 엉뚱한 폴더를 보게 된다 (실제로 겪은 버그)
+    return StdioServerParameters(command=sys.executable, args=[os.path.join(ROOT, "ops", "server.py")],
+                                 env={**os.environ})
 
 DIAGNOSES = ["healthy", "slow_but_progressing", "finished", "hung", "hung_at_shutdown",
              "crashed", "oom", "nan_loss", "unknown"]
@@ -38,6 +47,10 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
 1. list_jobs로 전체 상태를 본다.
 2. 조금이라도 이상해 보이는 job(프로세스가 죽었음, 로그가 오래 안 바뀜, step이 total에 못 미친 채 멈춤 등)은
    반드시 tail_log로 로그를 직접 확인한 뒤에 진단한다. 숫자 요약만 보고 진단하지 마라.
+   - "로그가 오래 안 바뀜"은 절대 시간이 아니라 log_age_vs_interval(평소 로그 간격 대비 배수)로 판단한다.
+     예: 평소 1초마다 쓰던 job이 25초째 조용하면(25배) 멈춘 것이다. 평소 20초마다 쓰던 job이 15초째면 정상이다.
+   - last_loss, last_step_time_s는 "마지막으로 찍힌 줄"의 값이다. 멈춘 job도 멈추기 직전 줄은 정상이므로,
+     이 값이 정상이라고 해서 지금 진행 중이라는 뜻은 아니다.
 3. 필요하면 gpu_status, job_status를 쓴다.
 
 진단 종류 (diagnosis)
@@ -51,13 +64,13 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
 - nan_loss             : loss가 nan/inf인데 계속 돌고 있음 (GPU 낭비)
 - unknown              : 판단할 근거가 부족함
 
-조치 정책 (request_action)
+조치 정책 (보고서의 action_requested. 여기 적은 조치가 그대로 사람에게 승인 요청으로 간다)
 - hung, hung_at_shutdown, nan_loss → terminate 요청
 - hung으로 종료된 job은 이전 체크포인트가 정상이므로 종료 후 restart가 적절하다. 단 아직 살아 있으면 terminate만 먼저 요청한다
 - crashed, oom → 이미 죽었으므로 요청하지 않는다. 그대로 재시작하면 같은 실패가 반복되므로 원인과 고칠 점을 보고서에 쓴다
 - healthy, slow_but_progressing, finished, unknown → 요청하지 않는다
 - 실험을 잘못 죽이는 것이 가장 비싼 실수다. 확신이 없으면 요청하지 말고 unknown으로 보고하라
-- request_action의 reason에는 사람이 바로 판단할 수 있게 근거(로그 내용, 수치)를 쓴다
+- evidence에는 사람이 승인 여부를 바로 판단할 수 있게 근거(로그 내용, 수치)를 쓴다
 
 마지막 답은 보고서 JSON으로 한다. evidence와 recommendation은 한국어로 짧게."""
 
@@ -113,7 +126,8 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
 
         if not msg.tool_calls:
             trace["latency_s"] = round(time.perf_counter() - t0, 1)
-            return {"report": json.loads(msg.content), "trace": trace}
+            report = json.loads(msg.content)
+            return {"report": report, "trace": trace, "requests": file_requests(report)}
 
         for call in msg.tool_calls:
             args = json.loads(call.function.arguments)
@@ -129,8 +143,22 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
     return {"report": {"jobs": []}, "trace": trace, "error": "MAX_STEPS 초과"}
 
 
+def file_requests(report: dict) -> list[dict]:
+    """보고서에 적힌 조치를 코드가 승인 대기열에 넣는다 → 보고서(말)와 대기열(행동)이 항상 일치한다."""
+    filed = []
+    for j in report["jobs"]:
+        if j["action_requested"] == "none":
+            continue
+        try:
+            item = approvals.request(j["job_id"], j["action_requested"], f"[{j['diagnosis']}] {j['evidence']}")
+            filed.append({"job_id": j["job_id"], "action": item["action"], "approval_id": item["id"]})
+        except ValueError as e:  # LLM이 없는 job_id를 지어낸 경우 등
+            filed.append({"job_id": j["job_id"], "action": j["action_requested"], "error": str(e)})
+    return filed
+
+
 async def run_once() -> dict:
-    async with Client(OPS_SERVER) as mcp:
+    async with Client(ops_server()) as mcp:
         listed = await mcp.list_tools()
         tools = [{"type": "function",
                   "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}}
@@ -149,6 +177,8 @@ def print_report(result: dict) -> None:
     print(f"\nLLM 호출 {t['llm_calls']}회, 도구 호출 {len(t['tool_calls'])}회, {t['latency_s']}s, "
           f"토큰 in {t['input_tokens']} / out {t['output_tokens']}")
     print(f"도구: {calls}")
+    for r in result.get("requests", []):
+        print(f"승인 요청: {r}")
     if result.get("error"):
         print("!", result["error"])
 
