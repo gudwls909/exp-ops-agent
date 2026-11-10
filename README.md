@@ -99,15 +99,21 @@ Agent가 틀린 2개는 "살아 있는데 오래 조용한 job"을 healthy/finis
 반복해서 실패한 조치는 검증 단계에서 거부한다.
 
 ```bash
-python eval/run_memory_eval.py --episodes 3   # memory off/on, 같은 장애 순서, 에피소드당 최대 3라운드
+python eval/run_memory_eval.py --episodes 8 --seed 1 --gpu 0   # memory off/on, 같은 장애 순서, 에피소드당 최대 3라운드
+python eval/summarize_memory.py eval/results/*_memory_s1.json eval/results/*_memory_s2.json   # 짝 비교 + bootstrap CI
 ```
 
-| | 해결 | shard 멈춤 해결 라운드 (ep1, ep2, ep3) | 에피소드당 비용 |
-|---|---|---|---|
-| memory off | 5/6 | R2, 실패, R2 | $0.036 |
-| memory on | 6/6 | R2, **R1**, R3 | $0.029 |
+seed 2개 × 8 에피소드 (같은 seed·에피소드 = 같은 장애 → 짝 비교, 해결 못 함 = 4라운드)
 
-에피소드 3개라 아직 우연과 구분되지 않는다. 1차 실행의 더 좋아 보이던 숫자는 결과 판정(critic) 버그 때문이었다 — troubleshooting_log 20~22번.
+| | 재시작해도 같은 shard에서 멈추는 job: 첫 라운드 해결 (ep2 이후) | 평균 라운드 | OOM (첫 라운드) | 에피소드당 비용 |
+|---|---|---|---|---|
+| memory off | 0/14 | 2.44 | 16/16 | $0.037 |
+| **memory on** | **12/14** | **1.38** | 16/16 | **$0.023** |
+
+- shard 멈춤 짝 16개 평균 차이 **+1.06라운드, 95% CI [+0.62, +1.44]**. memory on은 ep4부터 모든 장애를 첫 라운드에 해결.
+- memory off는 매번 "처음 멈춘 job은 같은 설정으로 재시작"부터 해서 1라운드를 버렸다. memory on은 앞 에피소드의 성공·실패 기록을 **다른 shard 번호**에 적용했다.
+- 한계: 효과는 "경험 없이는 첫 시도에 맞히기 어려운" 장애 1종에서만 났고(OOM은 차이 0), 그 장애는 직접 설계했다. 시뮬레이터, 모델 1개, seed 2개.
+- 과정: 처음 3 에피소드 결과는 결과 판정(critic) 버그로 무효였고, 고친 뒤 3 에피소드로는 우연과 구분되지 않았다 — troubleshooting_log 20~24번.
 
 평가로 찾아서 고친 것
 
@@ -139,5 +145,6 @@ python eval/run_memory_eval.py --episodes 3   # memory off/on, 같은 장애 순
 - [x] 근거 대조(보고서에 인용한 오류가 그 job 로그에 실제로 있나), 수정 평가 held-out
 - [ ] 일관성 검사(살아 있는데 오래 조용한 job을 정상으로 보고하면 거부) + 새 held-out
 - [x] 검증된 조치를 runbook으로 저장·재사용 (memory) + 1차 ablation
-- [ ] memory ablation 확대 (에피소드·seed 늘리기)
+- [x] memory ablation 확대 (seed 2개 × 8 에피소드, 짝 비교 + CI)
+- [ ] 디스크 사용량 감시 (평가가 디스크를 채운 사고 이후, 23번)
 - [ ] FastAPI 승인 API, Docker

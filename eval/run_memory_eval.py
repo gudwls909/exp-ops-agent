@@ -41,6 +41,13 @@ ROUND_TIMEOUT_S = 150
 PRICE = {"gpt-5-mini": {"input": 0.25, "output": 2.00}}
 
 
+
+def remove_checkpoints(runs_dir):
+    for root, _, files in os.walk(runs_dir):
+        for n in files:
+            if n.startswith("ckpt") and n.endswith(".pt"):
+                os.remove(os.path.join(root, n))
+
 def episode_jobs(rng):
     shard = rng.randint(1, 5)
     big = rng.choice([524288, 786432])
@@ -152,6 +159,7 @@ async def run_episode(cond, ep, gpu, base_dir, rng):
         approvals.verify_outcomes()  # 마지막 라운드 결과도 runbook에 남긴다 (다음 에피소드가 쓴다)
     finally:
         kill_all(jobs_mod, truth)
+        remove_checkpoints(runs_dir)  # 평가가 끝난 job의 체크포인트는 필요 없다 (디스크가 꽉 찼던 일, 23번)
 
     touched = any(it["job_id"] in truth and not truth[it["job_id"]]["target"] for it in approvals._load())
     return {
@@ -185,7 +193,7 @@ async def main():
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    base_dir = os.path.join(EVAL_DIR, "runs", "mem_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    base_dir = os.path.join(EVAL_DIR, "runs", f"mem_{datetime.now().strftime('%Y%m%d_%H%M%S')}_s{args.seed}_g{args.gpu}")
     results = []
     for cond in ("memory_off", "memory_on"):
         rng = random.Random(args.seed)  # 두 조건이 같은 장애 순서(같은 shard 번호, 같은 batch)를 보게
@@ -195,7 +203,7 @@ async def main():
 
     out_dir = os.path.join(EVAL_DIR, "results")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + "_memory.json")
+    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + f"_memory_s{args.seed}.json")
     with open(out, "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=2, default=str)
     print(f"자세한 결과: {out}")

@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--slow-factor", type=float, default=20, help="slow 모드에서 몇 배 느려지나")
     p.add_argument("--ckpt-every", type=int, default=100)
+    p.add_argument("--keep-last", type=int, default=5, help="최근 체크포인트 몇 개를 남기나")
+    p.add_argument("--keep-every", type=int, default=100, help="이 step의 배수인 체크포인트는 오래돼도 남긴다 (되돌아갈 지점)")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--runs-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runs"))
     p.add_argument("--resume", action="store_true", help="마지막 체크포인트부터 이어서 학습")
@@ -90,6 +92,18 @@ def lr_at(step, args):
 
 def ckpt_file(job_dir, step):
     return os.path.join(job_dir, f"ckpt-{step:06d}.pt")
+
+
+def prune_checkpoints(job_dir, keep_last, keep_every):
+    """체크포인트 보관 정책: 최근 keep_last개 + keep_every 배수 step만 남긴다.
+    전에는 전부 남겨서 오래 도는 job 하나가 수 GB, 평가 전체로 약 100GB를 써서 디스크가 꽉 찼다 (troubleshooting_log 23번).
+    최근 것만 남기면 안 된다: loss가 망가진 지 오래된 job은 최근 체크포인트가 전부 망가져 있어서 되돌아갈 곳이 없다.
+    그래서 오래된 "이정표" 체크포인트를 일정 간격으로 남긴다."""
+    steps = sorted(int(n[5:11]) for n in os.listdir(job_dir) if n.startswith("ckpt-") and n.endswith(".pt"))
+    recent = set(steps[-keep_last:])
+    for st in steps:
+        if st not in recent and st % keep_every != 0:
+            os.remove(ckpt_file(job_dir, st))
 
 
 def setup_logging(log_path):
@@ -238,6 +252,7 @@ def main():
             torch.save(ck, ckpt_path)
             torch.save(ck, ckpt_file(job_dir, step))
             log.info(f"Saved checkpoint at step {step}")
+            prune_checkpoints(job_dir, args.keep_last, args.keep_every)
 
     log.info("Training finished. Iteration limit reached")
     if args.fail == "hang_at_shutdown":

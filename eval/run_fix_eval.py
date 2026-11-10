@@ -48,6 +48,13 @@ PRICE = {"gpt-5-mini": {"input": 0.25, "output": 2.00}}
 # ---------------------------------------------------------------
 # 시나리오와 "좋은 수정"의 기준 (정답). Agent는 이 기준을 모른다
 # ---------------------------------------------------------------
+
+def remove_checkpoints(runs_dir):
+    for root, _, files in os.walk(runs_dir):
+        for n in files:
+            if n.startswith("ckpt") and n.endswith(".pt"):
+                os.remove(os.path.join(root, n))
+
 def ok_diverge(ch, resume):
     # 원인: stage2_lr=1e3. 좋은 수정 = 학습률 관련 설정만 낮추고, 발산 전(step 150 이전) 체크포인트부터
     lr_keys = {"stage2_lr", "max_lr", "warmup_steps"}
@@ -238,6 +245,7 @@ async def run_one(idx, gpu, method, set_name):
             result["jobs"][j] = row
     finally:
         kill_all(jobs_mod, truth)
+        remove_checkpoints(runs_dir)  # 평가가 끝난 job의 체크포인트는 필요 없다 (디스크가 꽉 찼던 일, 23번)
     return result
 
 

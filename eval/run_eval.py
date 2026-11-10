@@ -82,6 +82,13 @@ RELATIVE_K = [5, 10]                     # 규칙 B: 로그가 "그 job의 평�
 PRICE = {"gpt-5-mini": {"input": 0.25, "output": 2.00}}  # USD / 1M 토큰
 
 
+
+def remove_checkpoints(runs_dir):
+    for root, _, files in os.walk(runs_dir):
+        for n in files:
+            if n.startswith("ckpt") and n.endswith(".pt"):
+                os.remove(os.path.join(root, n))
+
 def launch(runs_dir, gpu, scenario):
     """시나리오의 job들을 랜덤 id로 띄운다. 정답표(truth)는 여기서만 들고 있다."""
     # 이 스크립트가 job의 "부모 프로세스"라서, 끝난 job을 회수(wait)하지 않으면 좀비로 남는다.
@@ -183,6 +190,7 @@ async def run_one(run_idx, gpu, set_name):
         requested = {it["job_id"]: it["action"] for it in approvals._load()}
     finally:
         cleanup(jobs_mod, truth)
+        remove_checkpoints(runs_dir)  # 평가가 끝난 job의 체크포인트는 필요 없다 (디스크가 꽉 찼던 일, 23번)
 
     diag = {j["job_id"]: j["diagnosis"] for j in result["report"]["jobs"]}
     t = result["trace"]
