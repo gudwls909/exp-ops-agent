@@ -8,7 +8,7 @@ GPU 학습 job의 장애를 감지하고 원인을 진단한 뒤, **사람의 �
 > - **감지**: 규칙은 threshold를 낮추면 느린 정상 job을 죽이고(false kill 3/15), 높이면 장애를 전부 놓친다(12/12). Agent는 처음 보는 조건에서 **false kill 0/15, 놓침 0/12**.
 > - **수정**: 설정이 원인인 장애(lr 발산·OOM·손상 데이터)를 처음 보는 조건에서 **6/6** 올바르게 고쳤다 (그냥 재시작은 0/6).
 > - **메모리**: 결과가 확인된 조치만 runbook으로 기억하자, 재시작으로는 안 풀리는 장애를 첫 시도에 푼 비율이 **0/14 → 12/14** (95% CI 밖), 비용 −39%.
-> - **과정**: 실패·회귀·평가 버그 24건과 그 해결을 [문제 해결 기록](docs/troubleshooting_log.md)에 남겼다. 발표용 요약: [docs/highlights.md](docs/highlights.md)
+> - **과정**: 실패·회귀·평가 버그 25건과 그 해결을 [문제 해결 기록](docs/troubleshooting_log.md)에 남겼다. 발표용 요약: [docs/highlights.md](docs/highlights.md)
 
 ## 왜 만들었나
 
@@ -93,7 +93,7 @@ memory off/on × seed 2개 × 8 에피소드. 같은 seed·에피소드면 두 �
 
 ## 문제 해결 기록에서 고른 것
 
-전체 24건: [docs/troubleshooting_log.md](docs/troubleshooting_log.md)
+전체 25건: [docs/troubleshooting_log.md](docs/troubleshooting_log.md)
 
 | # | 일어난 일 | 원인 | 해결 |
 |---|---|---|---|
@@ -109,7 +109,7 @@ memory off/on × seed 2개 × 8 에피소드. 같은 seed·에피소드면 두 �
 - **시뮬레이터 평가다.** 장애 유형·로그 형식을 직접 설계했다. 실제 연구 로그를 재생하는 평가가 필요하다.
 - **남은 실패 유형**: 살아 있는데 오래 조용한 job을 정상으로 보고. 코드로 일관성 검사를 넣고 새 held-out으로 재야 한다.
 - 모델 1개(gpt-5-mini), 평가 반복 수 2~3회(메모리는 16쌍).
-- 디스크 사용량 감시, FastAPI 승인 API, Docker.
+- 디스크 사용량 감시(평가가 디스크를 채운 일 이후, 23번). 승인 대기열을 JSON 파일 대신 DB로(서버 여러 대일 때 동시 승인 방지).
 
 ## 실행
 
@@ -118,7 +118,7 @@ conda create -n exp-ops python=3.11 && conda activate exp-ops
 pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install mcp==2.3.0 openai==3.46.0 python-dotenv==1.2.4 pytest==9.2.0
 cp .env.example .env        # OPENAI_API_KEY 입력
-pytest                      # 48개, API 호출 없음
+pytest                      # 54개, OpenAI API 호출 없음
 ```
 
 직접 돌려 보기
@@ -130,6 +130,32 @@ python agent/agent.py       # 순찰 1회: 진단 보고서 + 승인 요청 등�
 python ops/approve.py       # 대기 중인 요청 보기
 python ops/approve.py 1 --yes
 ```
+
+승인 API (웹 화면·슬랙 버튼이 붙을 자리)
+
+```bash
+pip install -r requirements.txt
+OPS_API_TOKEN=<임의의 긴 문자열> uvicorn api.app:app --port 8100
+curl localhost:8100/jobs
+curl -X POST localhost:8100/patrol -H "X-API-Token: $OPS_API_TOKEN"                  # 순찰 → 승인 요청 등록
+curl "localhost:8100/approvals?status=pending"
+curl -X POST localhost:8100/approvals/1/approve -H "X-API-Token: $OPS_API_TOKEN" \
+     -H "Content-Type: application/json" -d '{"decided_by": "me"}'
+```
+
+조작 API(순찰·승인·거절)는 토큰이 있어야 한다. 학습 job을 죽일 수 있는 버튼이기 때문이다. 같은 요청이 동시에 두 번 승인되지 않게 대기열을 잠근다.
+
+Docker (학습 job은 호스트에서 돌고, 컨테이너는 그 job을 보고 승인된 조치를 실행한다)
+
+```bash
+docker build -t exp-ops-api .
+docker run -d --pid=host --user $(id -u):$(id -g) --security-opt apparmor=unconfined \
+  -e OPS_API_TOKEN=... -v $(pwd)/runs:/app/runs -v $(pwd)/state:/app/state -p 8100:8100 exp-ops-api
+```
+
+- `--pid=host`: 호스트의 학습 프로세스를 보고 종료하려면 필요하다. `--user`: root가 아니라 같은 사용자로 돌려, 그 사용자의 job 말고는 종료할 수 없게 한다.
+- `apparmor=unconfined`: Docker 기본 AppArmor 정책이 컨테이너 밖으로의 신호를 막아 종료가 실패했다(25번). 데모용 설정이며, 운영이라면 필요한 신호만 허용하는 전용 프로필이 맞다.
+- 재시작은 학습 환경(torch, GPU)이 필요해서 이 이미지 안에서는 동작하지 않는다(이미지 220MB). 조회·진단·승인·종료까지가 컨테이너의 범위다.
 
 평가 (실제 API 호출, 수 분~1시간, 수십 원~수백 원)
 
@@ -151,6 +177,9 @@ python eval/summarize_memory.py eval/results/*_memory_s*.json
 | `ops/approvals.py` | 승인 대기열, 실행, 결과 확인(critic) |
 | `ops/runbooks.py` | 장애 서명, 검증된 조치 저장·검색 |
 | `agent/agent.py` | 순찰 루프, 운영 정책, 근거 대조, 보고서 → 승인 요청 |
+| `api/app.py` | 승인 API (FastAPI, 토큰 인증) |
+| `Dockerfile` | 조회·진단·승인 API 이미지 |
 | `eval/` | 감지·수정·메모리 평가와 통계 |
 | `tests/` | 안전장치·파싱·검증·메모리 테스트 |
-| `docs/troubleshooting_log.md` | 문제 해결 기록 24건 |
+| `docs/troubleshooting_log.md` | 문제 해결 기록 25건 |
+| `docs/highlights.md` | 발표·면접용 정리 |

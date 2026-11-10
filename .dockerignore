@@ -1,0 +1,11 @@
+.env
+.git
+runs/
+state/
+eval/
+tests/
+docs/
+sim/
+baseline/
+__pycache__/
+.pytest_cache/

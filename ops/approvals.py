@@ -110,6 +110,9 @@ def decide(approval_id: int, approve: bool, decided_by: str = "human") -> dict:
         except ValueError as e:
             item["result"] = f"실행 직전 검증 실패: {e}"
             item["status"] = "failed"
+        except OSError as e:  # 신호를 보낼 권한이 없음 등 (컨테이너 보안 정책에 막힌 경우 — README Docker 참고)
+            item["result"] = f"실행 실패 (권한/OS 오류): {e}"
+            item["status"] = "failed"
     else:
         item["status"] = "rejected"
     item["decided_by"] = decided_by
