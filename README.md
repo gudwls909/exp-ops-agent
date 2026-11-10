@@ -24,7 +24,8 @@ ops/approvals.py (승인 대기열) ◀── 사람: ops/approve.py ──▶ t
 ## 평가
 
 ```bash
-python eval/run_eval.py --repeat 3   # 실패 8종 job을 실제 GPU에서 띄우고 Agent와 규칙 베이스라인을 비교
+python eval/run_eval.py --repeat 3                 # dev: 실패 8종 job을 실제 GPU에서 띄우고 Agent와 규칙 비교
+python eval/run_eval.py --set heldout --repeat 3   # held-out: 개발 중에 보지 않은 조건
 pytest                               # 안전장치·파싱 테스트 23개
 ```
 
@@ -41,6 +42,18 @@ pytest                               # 안전장치·파싱 테스트 23개
 | 규칙 A (절대 30~60s) | 0/15 | 9/9 | - | $0 | ~0s |
 | 규칙 B (평소 간격 ×5, ×10) | 0/15 | 3/9 (NaN) | - | $0 | ~0s |
 
+Held-out (개발 중에 한 번도 돌리지 않은 조건 9개: 대기 60초, 학습 속도·로그 빈도·실패 시점 변경, 50배 느려진 정상 job, hang 2개. 결과를 보고 고치지 않음)
+
+| 방법 | false kill | 놓침 | 진단 정확도 | 비용/순찰 |
+|---|---|---|---|---|
+| **Agent** | **0/15** | **0/12** | 25/27 | $0.017 |
+| 규칙 A (절대 10~30s) | 3/15 | 3/12 | - | $0 |
+| 규칙 A (절대 60s) | 0/15 | 12/12 | - | $0 |
+| 규칙 B (평소 간격 ×5, ×10) | 3/15 | 3/12 | - | $0 |
+
+규칙은 threshold를 낮추면 느린 정상 job을 죽이고, 높이면 장애를 전부 놓친다. Agent가 틀린 2개는 느린 job을 `healthy`로 분류한 것(조치는 맞음).
+자세한 분석: [docs/troubleshooting_log.md](docs/troubleshooting_log.md)
+
 평가로 찾아서 고친 것
 
 | 발견 | 원인 | 조치 | 결과 |
@@ -53,7 +66,7 @@ pytest                               # 안전장치·파싱 테스트 23개
 
 한계 (다음에 할 것)
 
-- 위 8개 시나리오의 실패를 보고 도구와 프롬프트를 고쳤다. **고칠 때 보지 않은 held-out 시나리오**(다른 속도·대기 시간, 겹친 실패, 처음 보는 실패 유형)로 다시 재야 한다.
+- dev 시나리오의 실패를 보고 도구와 프롬프트를 고쳤다. held-out에서도 결과가 유지됐지만, 처음 보는 실패 유형(예: loss가 안 움직임)은 아직 없다.
 - 3회 반복이라 신뢰구간이 넓고, 확인 시점이 30초로 고정되어 있다.
 - 시뮬레이터만으로 평가했다. 실제 연구 로그 재생으로 검증해야 한다.
 
@@ -65,7 +78,8 @@ pytest                               # 안전장치·파싱 테스트 23개
 - [x] 테스트 (`tests/`): 실행 도구 미노출, 승인 전 미실행, job_id 검증, pid 재사용 방어, SIGTERM→SIGKILL, 정답 누출 방지, 로그 파싱, 보고서→대기열
 - [x] Agent (`agent/agent.py`): 순찰 1회 → JSON 보고서 → 승인 요청
 - [x] 평가 (`eval/run_eval.py`): Agent vs 규칙 베이스라인
-- [ ] held-out 시나리오, 실제 로그 재생
+- [x] held-out 시나리오 평가
+- [ ] 실제 로그 재생
 - [ ] 원인을 고친 재시작 제안 (예: OOM → batch 축소 + gradient accumulation), 수정 성공률 평가
 - [ ] 검증된 조치를 runbook skill로 저장·재사용 (memory) + ablation
 - [ ] FastAPI 승인 API, Docker

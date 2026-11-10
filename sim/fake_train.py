@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument("--fail-at", type=int, default=None, help="몇 step에서 실패할지 (기본: 전체의 절반)")
     p.add_argument("--step-time", type=float, default=0.1, help="step당 최소 시간(초). 실험을 사람이 볼 만한 속도로")
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--slow-factor", type=float, default=20, help="slow 모드에서 몇 배 느려지나")
     p.add_argument("--ckpt-every", type=int, default=100)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--runs-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runs"))
@@ -155,7 +156,7 @@ def main():
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        time.sleep(max(0.0, args.step_time * (20 if slow else 1) - (time.time() - t0)))
+        time.sleep(max(0.0, args.step_time * (args.slow_factor if slow else 1) - (time.time() - t0)))
 
         if step % args.log_every == 0:
             mem = torch.cuda.memory_allocated(device) / 2 ** 20 if device.type == "cuda" else 0

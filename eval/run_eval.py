@@ -16,6 +16,7 @@ week1 평가와 같은 구조 (케이스 × 방법 → 지표). 다른 점
 실행 (프로젝트 루트에서):
   python eval/run_eval.py              # 시나리오 1회 (약 2~3분, Agent 비용 약 $0.03)
   python eval/run_eval.py --repeat 3
+  python eval/run_eval.py --set heldout --repeat 3   # 개발 중에 보지 않은 조건
 """
 
 import argparse
@@ -33,23 +34,55 @@ EVAL_DIR = os.path.join(ROOT, "eval")
 
 # 정답표: 주입한 실패 → 기대하는 진단과 조치
 # (steps가 짧은 none은 평가 시점에 이미 끝나 있으므로 finished)
-SCENARIO = [
-    {"fail": "none",             "steps": 3000, "expect": "healthy",              "action": "none"},
-    {"fail": "none",             "steps": 100,  "expect": "finished",             "action": "none"},
-    {"fail": "slow",             "steps": 3000, "expect": "slow_but_progressing", "action": "none"},
-    {"fail": "hang",             "steps": 3000, "expect": "hung",                 "action": "terminate"},
-    {"fail": "hang_at_shutdown", "steps": 100,  "expect": "hung_at_shutdown",     "action": "terminate"},
-    {"fail": "crash",            "steps": 3000, "expect": "crashed",              "action": "none"},
-    {"fail": "oom",              "steps": 3000, "expect": "oom",                  "action": "none"},
-    {"fail": "nan",              "steps": 3000, "expect": "nan_loss",             "action": "terminate"},
-]
-WAIT_S = 30                      # job을 띄우고 이만큼 기다린 뒤 평가 (hang_at_shutdown, finished가 끝나 있을 시간)
+SETS = {
+    # dev: 개발하면서 보고 고친 시나리오 (도구/프롬프트를 이걸 보고 고쳤다 → 점수가 좋게 나오는 게 당연)
+    "dev": {
+        "wait_s": 30,
+        "jobs": [
+            {"fail": "none",             "steps": 3000, "expect": "healthy",              "action": "none"},
+            {"fail": "none",             "steps": 100,  "expect": "finished",             "action": "none"},
+            {"fail": "slow",             "steps": 3000, "expect": "slow_but_progressing", "action": "none"},
+            {"fail": "hang",             "steps": 3000, "expect": "hung",                 "action": "terminate"},
+            {"fail": "hang_at_shutdown", "steps": 100,  "expect": "hung_at_shutdown",     "action": "terminate"},
+            {"fail": "crash",            "steps": 3000, "expect": "crashed",              "action": "none"},
+            {"fail": "oom",              "steps": 3000, "expect": "oom",                  "action": "none"},
+            {"fail": "nan",              "steps": 3000, "expect": "nan_loss",             "action": "terminate"},
+        ],
+    },
+    # heldout: 개발할 때 한 번도 돌려 보지 않은 조건. ⚠️ 이 결과를 보고 도구/프롬프트를 고치면 안 된다
+    #   (고치면 이것도 dev가 된다. 고친 뒤에는 새 held-out을 만들어야 한다)
+    #   달라진 점: 대기 시간, 학습 속도(step_time), 로그 빈도, 실패 시점, slow의 느려지는 정도
+    "heldout": {
+        "wait_s": 60,
+        "jobs": [
+            {"fail": "none", "steps": 5000, "args": {"--step-time": "0.3", "--log-every": "5"},
+             "expect": "healthy", "action": "none"},
+            {"fail": "none", "steps": 60, "args": {"--step-time": "0.03"},
+             "expect": "finished", "action": "none"},
+            # 50배 느려짐 → 로그 간격 50초. 절대 30초 규칙은 거의 확실히 잘못 죽인다
+            {"fail": "slow", "steps": 5000, "args": {"--fail-at": "40", "--slow-factor": "50"},
+             "expect": "slow_but_progressing", "action": "none"},
+            {"fail": "hang", "steps": 5000, "args": {"--fail-at": "15", "--step-time": "0.3", "--log-every": "5"},
+             "expect": "hung", "action": "terminate"},
+            {"fail": "hang", "steps": 5000, "args": {"--fail-at": "500", "--step-time": "0.03"},
+             "expect": "hung", "action": "terminate"},
+            {"fail": "hang_at_shutdown", "steps": 60, "args": {"--step-time": "0.3"},
+             "expect": "hung_at_shutdown", "action": "terminate"},
+            {"fail": "nan", "steps": 5000, "args": {"--fail-at": "20", "--step-time": "0.3", "--log-every": "5"},
+             "expect": "nan_loss", "action": "terminate"},
+            {"fail": "crash", "steps": 5000, "args": {"--fail-at": "150"},
+             "expect": "crashed", "action": "none"},
+            {"fail": "oom", "steps": 5000, "args": {"--fail-at": "10"},
+             "expect": "oom", "action": "none"},
+        ],
+    },
+}
 BASELINE_THRESHOLDS = [10, 15, 30, 60]   # 규칙 A: 로그가 N초 넘게 조용하면 HANG (vb_hang_killer 방식)
 RELATIVE_K = [5, 10]                     # 규칙 B: 로그가 "그 job의 평소 간격 × K"보다 오래 조용하면 HANG
 PRICE = {"gpt-5-mini": {"input": 0.25, "output": 2.00}}  # USD / 1M 토큰
 
 
-def launch(runs_dir, gpu):
+def launch(runs_dir, gpu, scenario):
     """시나리오의 job들을 랜덤 id로 띄운다. 정답표(truth)는 여기서만 들고 있다."""
     # 이 스크립트가 job의 "부모 프로세스"라서, 끝난 job을 회수(wait)하지 않으면 좀비로 남는다.
     # 좀비는 os.kill(pid, 0)에 "살아 있다"고 답하므로 규칙 베이스라인이 끝난 job을 HANG으로 오판한다.
@@ -57,14 +90,17 @@ def launch(runs_dir, gpu):
     import signal
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     truth = {}
-    jobs_ = SCENARIO[:]
+    jobs_ = scenario[:]
     random.shuffle(jobs_)  # 띄우는 순서도 섞는다
     for spec in jobs_:
         job_id = f"run-{random.randrange(16 ** 4):04x}"
         truth[job_id] = spec
+        extra = {"--fail-at": "50", **spec.get("args", {})}
         cmd = [sys.executable, os.path.join(ROOT, "sim", "fake_train.py"), "--job-id", job_id,
-               "--fail", spec["fail"], "--steps", str(spec["steps"]), "--fail-at", "50",
+               "--fail", spec["fail"], "--steps", str(spec["steps"]),
                "--gpu", str(gpu), "--runs-dir", runs_dir]
+        for k, v in extra.items():
+            cmd += [k, v]
         subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return truth
 
@@ -105,7 +141,8 @@ def cleanup(jobs_mod, truth):
             pass
 
 
-async def run_one(run_idx, gpu):
+async def run_one(run_idx, gpu, set_name):
+    scenario = SETS[set_name]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     runs_dir = os.path.join(EVAL_DIR, "runs", f"{stamp}_{run_idx}")
     state_dir = os.path.join(runs_dir, "_state")
@@ -119,9 +156,9 @@ async def run_one(run_idx, gpu):
     jobs_mod.RUNS_DIR, approvals.STATE_DIR = runs_dir, state_dir
     import agent
 
-    truth = launch(runs_dir, gpu)
-    print(f"[run {run_idx}] job {len(truth)}개 실행, {WAIT_S}초 대기...", file=sys.stderr)
-    time.sleep(WAIT_S)
+    truth = launch(runs_dir, gpu, scenario["jobs"])
+    print(f"[run {run_idx}] ({set_name}) job {len(truth)}개 실행, {scenario['wait_s']}초 대기...", file=sys.stderr)
+    time.sleep(scenario["wait_s"])
 
     try:
         # 같은 순간의 상태로 베이스라인 판정 (Agent는 순찰에 1~2분 걸리므로 먼저)
@@ -170,7 +207,7 @@ def summarize(runs):
     by_type = {}
     for r in runs:
         for j, t in r["truth"].items():
-            key = f"{t['fail']}({t['steps']})"
+            key = f"{t['fail']}({t['steps']}{','.join(f'{k[2:]}={v}' for k, v in t.get('args', {}).items())})"
             by_type.setdefault(key, []).append((t["expect"], r["agent"]["diagnosis"].get(j, "(누락)"),
                                                 r["agent"]["requested"].get(j, "none"), t["action"]))
     for key, rows in by_type.items():
@@ -198,14 +235,15 @@ async def main():
     p = argparse.ArgumentParser()
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--gpu", type=int, default=1)
+    p.add_argument("--set", choices=list(SETS), default="dev")
     args = p.parse_args()
 
-    runs = [await run_one(i, args.gpu) for i in range(args.repeat)]
+    runs = [await run_one(i, args.gpu, args.set) for i in range(args.repeat)]
     summarize(runs)
 
     out_dir = os.path.join(EVAL_DIR, "results")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
+    out = os.path.join(out_dir, datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{args.set}.json")
     with open(out, "w") as f:
         json.dump(runs, f, ensure_ascii=False, indent=2)
     print(f"\n자세한 결과: {out}")
