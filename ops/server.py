@@ -87,8 +87,10 @@ def job_config(job_id: str) -> str:
 
 @mcp.tool()
 def list_checkpoints(job_id: str) -> str:
-    """job의 step별 체크포인트 목록과 각 step에서 로그에 찍힌 loss.
-    loss가 망가지기(nan/폭주) '전'의 체크포인트를 골라 거기서부터 재시작을 제안할 때 쓴다."""
+    """job의 step별 체크포인트 목록. 각 항목: step, loss_logged_at_step, loss_at_next_log.
+    체크포인트 N은 step N의 업데이트가 끝난 뒤의 가중치다. step N 로그의 loss는 업데이트 '전' 값이라,
+    그 가중치가 멀쩡한지는 loss_at_next_log(그 가중치에서 출발한 다음 로그의 loss)로 판단하라.
+    loss가 망가지기(nan/폭주) '전'의 체크포인트를 골라 재시작을 제안할 때 쓴다."""
     try:
         return _ok({"job_id": job_id, "checkpoints": jobs.checkpoints(job_id)})
     except ValueError as e:

@@ -27,6 +27,9 @@ load_dotenv(os.path.join(ROOT, ".env"))
 sys.path.insert(0, os.path.join(ROOT, "ops"))
 
 import approvals  # noqa: E402
+import jobs  # noqa: E402
+
+MAX_REVISIONS = 1  # 검증에서 거부된 제안을 고쳐 쓸 기회
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 MAX_STEPS = 15
@@ -107,13 +110,10 @@ REPORT_FORMAT = {
                                     "max_lr": {"type": ["number", "null"]},
                                     "stage2_lr": {"type": ["number", "null"]},
                                     "warmup_steps": {"type": ["integer", "null"]},
-                                    "batch_size": {"type": ["integer", "null"]},
-                                    "stage2_batch": {"type": ["integer", "null"]},
                                     "grad_accum": {"type": ["integer", "null"]},
                                     "data_shards": {"type": ["string", "null"], "description": "예: \"0,1,2,4\""},
                                 },
-                                "required": ["max_lr", "stage2_lr", "warmup_steps", "batch_size", "stage2_batch",
-                                             "grad_accum", "data_shards"],
+                                "required": ["max_lr", "stage2_lr", "warmup_steps", "grad_accum", "data_shards"],
                                 "additionalProperties": False,
                             },
                             "resume_from_step": {"type": ["integer", "null"]},
@@ -138,7 +138,7 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "지금 모든 job을 점검하고 보고서를 써줘."},
     ]
-    trace = {"tool_calls": [], "llm_calls": 0, "input_tokens": 0, "output_tokens": 0}
+    trace = {"tool_calls": [], "llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "revisions": []}
     t0 = time.perf_counter()
 
     for _ in range(MAX_STEPS):
@@ -152,8 +152,17 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
-            trace["latency_s"] = round(time.perf_counter() - t0, 1)
             report = json.loads(msg.content)
+            # 승인 대기열에 넣기 전에 검증만 먼저 해 본다. 거부된 제안이 있으면 이유를 알려 주고 한 번 고쳐 쓰게 한다
+            # (전에는 거부된 제안이 조용히 버려져서, 방향은 맞았던 OOM 수정이 아예 사람에게 가지 못했다)
+            errors = validation_errors(report)
+            if errors and len(trace["revisions"]) < MAX_REVISIONS:
+                trace["revisions"].append(errors)
+                messages.append({"role": "user", "content":
+                    "보고서의 다음 제안이 검증에서 거부됐다. 허용 범위 안에서 고쳐서 보고서 전체를 다시 써라. "
+                    "(필요하면 도구를 다시 써도 된다)\n" + "\n".join(f"- {j}: {e}" for j, e in errors.items())})
+                continue
+            trace["latency_s"] = round(time.perf_counter() - t0, 1)
             return {"report": report, "trace": trace, "requests": file_requests(report)}
 
         for call in msg.tool_calls:
@@ -168,6 +177,21 @@ async def patrol(llm: AsyncOpenAI, mcp: Client, tools: list) -> dict:
 
     trace["latency_s"] = round(time.perf_counter() - t0, 1)
     return {"report": {"jobs": []}, "trace": trace, "error": "MAX_STEPS 초과"}
+
+
+def validation_errors(report: dict) -> dict:
+    """대기열에 넣지 않고 검증만. {job_id: 거부 이유}"""
+    errors = {}
+    for j in report["jobs"]:
+        try:
+            jobs.job_dir(j["job_id"])
+            if j["action_requested"] == "restart":
+                changes = {k: v for k, v in (j.get("changes") or {}).items() if v is not None}
+                jobs.validate_changes(j["job_id"], changes, j.get("resume_from_step"))
+        except ValueError as e:
+            if j["action_requested"] != "none":
+                errors[j["job_id"]] = str(e)
+    return errors
 
 
 def file_requests(report: dict) -> list[dict]:

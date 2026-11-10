@@ -124,9 +124,18 @@ def run_relative_baseline(jobs_mod, k):
     return acts
 
 
+# 살아 있는 정상 job: 여기에 terminate든 restart든 요청하면 "잘못 죽임"
+ALIVE_OK = {"healthy", "slow_but_progressing"}
+
+
 def score_actions(truth, actions):
-    false_kill = [j for j, t in truth.items() if t["action"] == "none" and actions.get(j) == "terminate"]
-    missed = [j for j, t in truth.items() if t["action"] == "terminate" and actions.get(j) != "terminate"]
+    """감지 평가: 살아 있는 장애 job을 멈추게 했나(놓침), 살아 있는 정상 job을 건드렸나(false kill).
+    2단계부터 Agent는 hung/nan에 terminate 대신 restart(종료 후 재시작)를 요청할 수 있다 → 둘 다 "개입"으로 센다.
+    이미 죽은 job(crash/oom/finished)에 대한 restart 제안은 죽이는 게 아니므로 여기서는 채점하지 않는다
+    (수정이 맞았는지는 run_fix_eval.py가 채점)."""
+    intervene = lambda j: actions.get(j) in ("terminate", "restart")  # noqa: E731
+    false_kill = [j for j, t in truth.items() if t["expect"] in ALIVE_OK and intervene(j)]
+    missed = [j for j, t in truth.items() if t["action"] == "terminate" and not intervene(j)]
     return false_kill, missed
 
 
@@ -171,7 +180,7 @@ async def run_one(run_idx, gpu, set_name):
         print(f"[run {run_idx}] Agent 순찰 중...", file=sys.stderr)
         result = await agent.run_once()
         # 행동 채점: 보고서에 뭐라고 썼든, 승인 대기열에 실제로 들어간 요청이 기준
-        requested = {it["job_id"]: it["action"] for it in approvals._load() if it["action"] == "terminate"}
+        requested = {it["job_id"]: it["action"] for it in approvals._load()}
     finally:
         cleanup(jobs_mod, truth)
 
@@ -200,8 +209,8 @@ async def run_one(run_idx, gpu, set_name):
 def summarize(runs):
     n_runs = len(runs)
     n_jobs = sum(len(r["truth"]) for r in runs)
-    n_safe = sum(sum(t["action"] == "none" for t in r["truth"].values()) for r in runs)
-    n_bad = n_jobs - n_safe
+    n_safe = sum(sum(t["expect"] in ALIVE_OK for t in r["truth"].values()) for r in runs)   # 살아 있는 정상 job
+    n_bad = sum(sum(t["action"] == "terminate" for t in r["truth"].values()) for r in runs)  # 살아 있는 장애 job
 
     print("\n=== 실패 유형별 Agent 진단 ===")
     by_type = {}
@@ -212,7 +221,7 @@ def summarize(runs):
                                                 r["agent"]["requested"].get(j, "none"), t["action"]))
     for key, rows in by_type.items():
         ok = sum(e == d for e, d, _, _ in rows)
-        got = ", ".join(f"{d}{'+T' if a == 'terminate' else ''}" for _, d, a, _ in rows)
+        got = ", ".join(f"{d}{ {'terminate': '+T', 'restart': '+R'}.get(a, '')}" for _, d, a, _ in rows)
         print(f"  {key:<24} 기대 {rows[0][0]:<22} {ok}/{len(rows)}   실제: {got}")
 
     print("\n=== 방법 비교 (조치 기준) ===")

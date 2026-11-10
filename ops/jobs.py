@@ -163,14 +163,22 @@ CKPT_RE = re.compile(r"^ckpt-(\d+)\.pt$")
 
 def checkpoints(job_id: str) -> list[dict]:
     """step별 체크포인트 목록 + 그 step에 로그로 찍힌 loss. 어느 체크포인트가 "망가지기 전"인지 고를 때 쓴다."""
+    # ⚠️ 체크포인트 N = "step N의 업데이트가 끝난 뒤"의 가중치. 그런데 step N 로그의 loss는 업데이트 "전"에 계산된 값이다.
+    #    그래서 step N에서 lr이 폭주하면 loss_logged(N)은 정상인데 체크포인트 N은 이미 망가져 있다 (실제로 겪은 함정).
+    #    이 체크포인트가 멀쩡한지는 "다음 로그의 loss"(이 가중치에서 출발한 결과)로 봐야 한다.
     d = job_dir(job_id)
     steps = sorted(int(m.group(1)) for n in os.listdir(d) if (m := CKPT_RE.match(n)))
-    loss_at = {}
+    logged = []  # (step, loss) 순서대로. 재시작 등으로 같은 step이 또 나오면 뒤의 것이 이긴다
     for line in tail(job_id, 100000):
         m = STEP_RE.search(line)
         if m and (lm := LOSS_RE.search(line)):
-            loss_at[int(m.group(1))] = lm.group(1)
-    return [{"step": st, "loss_logged": loss_at.get(st)} for st in steps]
+            logged.append((int(m.group(1)), lm.group(1)))
+    loss_at = dict(logged)
+    out = []
+    for st in steps:
+        nxt = next((l for s_, l in sorted(loss_at.items()) if s_ > st), None)
+        out.append({"step": st, "loss_logged_at_step": loss_at.get(st), "loss_at_next_log": nxt})
+    return out
 
 
 # ---------------------------------------------------------------
@@ -249,16 +257,18 @@ def terminate(job_id: str, grace_s: float = 15.0) -> str:
 
 # Agent가 바꾸자고 제안할 수 있는 설정과 허용 범위 (이 밖의 것은 전부 거부)
 #   - 실험의 "정체"를 바꾸는 설정(steps, 모델 구조, seed 등)은 목록에 없다
+#   - batch_size / stage2_batch도 뺐다: 프롬프트로 "batch는 줄이지 마라"고 해도 LLM이 3번 중 2번꼴로 줄였다
+#     (troubleshooting_log 10, 15번). 실험 의미 보존은 프롬프트가 아니라 여기서 강제한다.
+#     메모리가 모자라면 grad_accum으로만 해결할 수 있다 (실질 batch는 그대로)
 #   - data_shards는 "빼기"만 허용한다 (손상된 shard 제외). 새 데이터를 넣는 건 사람이 할 일
 CHANGEABLE = {
     "max_lr":       (float, 1e-6, 1.0),
     "stage2_lr":    (float, 1e-6, 1.0),
     "warmup_steps": (int, 1, 100_000),
-    "batch_size":   (int, 1, 1 << 20),
-    "stage2_batch": (int, 1, 1 << 24),
-    "grad_accum":   (int, 1, 1024),
+    "grad_accum":   (int, 1, 1 << 20),  # 상한은 아래에서 "batch보다 클 수 없음"으로 다시 검사
     "data_shards":  (str, None, None),
 }
+BROKEN_RATIO = 100  # 체크포인트 다음 loss가 그 전 최저 loss의 100배를 넘으면 "이미 망가진 체크포인트"
 
 
 def validate_changes(job_id: str, changes: dict | None, resume_from: int | None) -> tuple[dict, int | None]:
@@ -283,13 +293,44 @@ def validate_changes(job_id: str, changes: dict | None, resume_from: int | None)
             raise ValueError(f"{key} 값이 이상함: {value!r}")
         if not (lo <= v <= hi):
             raise ValueError(f"{key}={v}는 허용 범위 [{lo}, {hi}] 밖")
+        if key == "grad_accum":
+            biggest = max(int(config.get("batch_size", 1)), int(config.get("stage2_batch", 1)))
+            if v > biggest:
+                raise ValueError(f"grad_accum={v}는 batch({biggest})보다 클 수 없음")
         clean[key] = v
+    ckpts = checkpoints(job_id)
+    steps = [c["step"] for c in ckpts]
     if resume_from is not None:
-        steps = [c["step"] for c in checkpoints(job_id)]
         if int(resume_from) not in steps:
             raise ValueError(f"step {resume_from} 체크포인트 없음 (있는 것: {steps})")
         resume_from = int(resume_from)
+    # 망가진 체크포인트에서 재시작하면 설정을 고쳐도 소용없다 (troubleshooting_log 13번)
+    target = resume_from if resume_from is not None else (steps[-1] if steps else None)
+    if target is not None:
+        _check_not_broken(ckpts, target)
     return clean, resume_from
+
+
+def _loss_value(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _check_not_broken(ckpts: list[dict], step: int) -> None:
+    import math
+    healthy = [v for c in ckpts if c["step"] < step and (v := _loss_value(c["loss_logged_at_step"])) is not None
+               and math.isfinite(v)]
+    nxt_text = next(c["loss_at_next_log"] for c in ckpts if c["step"] == step)
+    nxt = _loss_value(nxt_text)
+    if nxt is None:
+        if nxt_text is not None:  # "nan" 같은 글자
+            raise ValueError(f"step {step} 체크포인트 다음 loss가 {nxt_text} → 이미 망가진 체크포인트. 더 이른 step을 지정하라")
+        return  # 다음 로그가 아직 없음 (방금 저장된 체크포인트) → 판단 불가, 통과
+    if not math.isfinite(nxt) or (healthy and nxt > BROKEN_RATIO * min(healthy)):
+        raise ValueError(f"step {step} 체크포인트 다음 loss가 {nxt_text} (그 전 최저 {min(healthy) if healthy else '?'}) "
+                         f"→ 이미 망가진 체크포인트. 더 이른 step을 지정하라 (있는 것: {[c['step'] for c in ckpts]})")
 
 
 def _without_flags(cmd: list[str], flags: set[str]) -> list[str]:

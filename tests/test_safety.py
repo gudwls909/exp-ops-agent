@@ -191,6 +191,9 @@ def _job_with_config(tmp_path, job_id, ckpt_steps=(20, 40)):
     ({"data_shards": "0,1,2,3,9"}, None),  # shard 추가는 불가 (빼기만)
     ({"data_shards": ""}, None),        # 다 빼는 것도 불가
     ({}, 999),                          # 없는 체크포인트
+    ({"stage2_batch": 1024}, None),     # batch는 바꿀 수 없다 (실험 의미 보존을 코드로 강제)
+    ({"batch_size": 128}, None),
+    ({"grad_accum": 2 ** 21}, None),    # batch보다 큰 grad_accum
 ])
 def test_bad_changes_rejected(env, tmp_path, changes, resume):
     env("j1")
@@ -230,3 +233,33 @@ def test_restart_with_changes_terminates_then_relaunches(env, tmp_path):
         assert history[-1]["changes"] == {"stage2_lr": 1e-4}  # 무엇을 바꿨는지 기록
     finally:
         os.kill(new_pid, signal.SIGKILL)
+
+
+# ---------------- 9. 검증 실패 이유를 Agent에게 돌려줄 수 있다 ----------------
+def test_validation_errors_for_revision(env, tmp_path):
+    import agent
+    env("j1"); env("j2")
+    _job_with_config(tmp_path, "j1"); _job_with_config(tmp_path, "j2")
+    nulls = {k: None for k in ["max_lr", "stage2_lr", "warmup_steps", "grad_accum", "data_shards"]}
+    report = {"jobs": [
+        {"job_id": "j1", "action_requested": "restart", "changes": {**nulls, "grad_accum": 2 ** 21}, "resume_from_step": None},
+        {"job_id": "j2", "action_requested": "restart", "changes": {**nulls, "grad_accum": 4}, "resume_from_step": 20},
+    ]}
+    errors = agent.validation_errors(report)
+    assert list(errors) == ["j1"] and "grad_accum" in errors["j1"]  # 이유가 구체적이어야 고쳐 쓸 수 있다
+    assert approvals.pending() == []  # 검증만 하고 대기열에는 넣지 않는다
+
+
+def test_broken_checkpoint_rejected(env, tmp_path):
+    env("j1")
+    d = _job_with_config(tmp_path, "j1", ckpt_steps=(100, 150))
+    # step 150에서 lr 폭주: 150 로그의 loss는 정상(업데이트 전 값)이지만 다음 로그가 폭주 → 체크포인트 150은 망가짐
+    (d / "train.log").write_text(
+        "2026-11-10 12:00:00 INFO step 100/300 loss 0.03\n"
+        "2026-11-10 12:00:01 INFO step 150/300 loss 0.025\n"
+        "2026-11-10 12:00:02 INFO step 160/300 loss 6e+31\n")
+    with pytest.raises(ValueError, match="망가진"):
+        approvals.request("j1", "restart", "x", changes={"stage2_lr": 1e-3}, resume_from=150)
+    with pytest.raises(ValueError, match="망가진"):
+        approvals.request("j1", "restart", "x", changes={"stage2_lr": 1e-3})  # 지정 안 하면 마지막(150) → 거부
+    assert approvals.request("j1", "restart", "x", changes={"stage2_lr": 1e-3}, resume_from=100)["resume_from"] == 100
