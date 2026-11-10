@@ -79,7 +79,8 @@ def test_mcp_exposes_no_execute_tools():
             return {t.name for t in (await c.list_tools()).tools}
 
     tools = asyncio.run(names())
-    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status"}  # 읽기 전용만. 요청도 도구가 아님
+    # 읽기 전용만. 요청도 도구가 아님
+    assert tools == {"list_jobs", "job_status", "tail_log", "gpu_status", "job_config", "list_checkpoints"}
     # 혹시 누가 실행 도구를 추가하면 이 테스트가 깨진다 → 리뷰에서 "왜 추가했나" 논의하게 된다
 
 
@@ -169,3 +170,63 @@ def test_report_actions_are_filed_by_code(env):
     filed = agent.file_requests(report)
     assert [it["job_id"] for it in approvals.pending()] == ["j1"]   # 요청한 것만, 정확히 하나
     assert "error" in next(f for f in filed if f["job_id"] == "ghost")  # 없는 job은 거부 (지어낸 id)
+
+
+# ---------------- 8. 설정 변경 제안의 검증 (허용 목록 + 범위) ----------------
+def _job_with_config(tmp_path, job_id, ckpt_steps=(20, 40)):
+    d = tmp_path / "runs" / job_id
+    (d / "config.json").write_text(json.dumps({"max_lr": 1e-3, "stage2_lr": 1000.0, "grad_accum": 1,
+                                                "stage2_batch": 1048576, "data_shards": "0,1,2,3"}))
+    for st in ckpt_steps:
+        (d / f"ckpt-{st:06d}.pt").write_bytes(b"x")
+    return d
+
+
+@pytest.mark.parametrize("changes,resume", [
+    ({"steps": 10}, None),              # 실험 정체를 바꾸는 설정은 목록에 없음
+    ({"seed": 1}, None),
+    ({"stage2_lr": 5.0}, None),         # 범위 밖 (lr ≤ 1)
+    ({"grad_accum": 0}, None),
+    ({"grad_accum": "many"}, None),     # 타입 이상
+    ({"data_shards": "0,1,2,3,9"}, None),  # shard 추가는 불가 (빼기만)
+    ({"data_shards": ""}, None),        # 다 빼는 것도 불가
+    ({}, 999),                          # 없는 체크포인트
+])
+def test_bad_changes_rejected(env, tmp_path, changes, resume):
+    env("j1")
+    _job_with_config(tmp_path, "j1")
+    with pytest.raises(ValueError):
+        approvals.request("j1", "restart", "x", changes=changes, resume_from=resume)
+    assert approvals.pending() == []  # 거부된 제안은 사람에게 가지도 않는다
+
+
+def test_changes_only_for_restart(env, tmp_path):
+    env("j1")
+    _job_with_config(tmp_path, "j1")
+    with pytest.raises(ValueError):
+        approvals.request("j1", "terminate", "x", changes={"max_lr": 1e-4})
+
+
+def test_restart_with_changes_terminates_then_relaunches(env, tmp_path):
+    # 가짜 job의 명령을 "인자를 무시하고 잠만 자는 파이썬"으로 → 재시작된 프로세스의 명령줄만 검사
+    pid = env("j1")
+    d = _job_with_config(tmp_path, "j1")
+    job = json.loads((d / "job.json").read_text())
+    job["cmd"] = ["-c", SLEEPER, "j1", "--stage2-lr", "1000", "--resume"]
+    (d / "job.json").write_text(json.dumps(job))
+
+    item = approvals.request("j1", "restart", "발산", changes={"stage2_lr": 1e-4, "grad_accum": None}, resume_from=20)
+    assert item["changes"] == {"stage2_lr": 1e-4} and item["resume_from"] == 20
+    done = approvals.decide(item["id"], approve=True)
+
+    assert not alive(pid)  # 살아 있던 원래 프로세스는 먼저 종료됐고
+    new_pid = int(done["result"].split("새 pid ")[1].rstrip(")"))
+    try:
+        cmdline = open(f"/proc/{new_pid}/cmdline", "rb").read().split(b"\0")
+        args = [a.decode() for a in cmdline if a]
+        assert args.count("--stage2-lr") == 1 and args[args.index("--stage2-lr") + 1] == "0.0001"  # 옛 값은 지워지고
+        assert "--resume" not in args and args[args.index("--resume-from") + 1] == "20"
+        history = json.loads((d / "changes.json").read_text())
+        assert history[-1]["changes"] == {"stage2_lr": 1e-4}  # 무엇을 바꿨는지 기록
+    finally:
+        os.kill(new_pid, signal.SIGKILL)

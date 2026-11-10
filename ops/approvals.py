@@ -42,11 +42,18 @@ def _save(items: list[dict]) -> None:
     os.replace(tmp, _path())  # 쓰다가 죽어도 파일이 반쯤 깨지지 않게: 임시 파일에 다 쓴 뒤 한 번에 교체
 
 
-def request(job_id: str, action: str, reason: str) -> dict:
-    """승인 요청을 만든다. 실행하지 않는다."""
+def request(job_id: str, action: str, reason: str, changes: dict | None = None,
+            resume_from: int | None = None) -> dict:
+    """승인 요청을 만든다. 실행하지 않는다.
+    restart는 changes(바꿀 설정)와 resume_from(어느 체크포인트부터)을 함께 받을 수 있다.
+    요청 시점에 검증한다 → 허용 범위 밖의 제안은 사람에게 가기 전에 거부된다."""
     jobs.job_dir(job_id)  # job_id 검증 (이상하면 ValueError)
     if action not in ACTIONS:
         raise ValueError(f"지원하지 않는 action: {action!r} (가능: {sorted(ACTIONS)})")
+    if action == "restart":
+        changes, resume_from = jobs.validate_changes(job_id, changes, resume_from)
+    elif changes or resume_from is not None:
+        raise ValueError("changes/resume_from은 restart에서만 쓸 수 있다")
     items = _load()
     # 같은 job, 같은 action으로 이미 대기 중인 요청이 있으면 새로 만들지 않는다 (Agent가 같은 요청을 반복하는 경우)
     for it in items:
@@ -57,6 +64,8 @@ def request(job_id: str, action: str, reason: str) -> dict:
         "job_id": job_id,
         "action": action,
         "reason": reason,
+        "changes": changes or {},
+        "resume_from": resume_from,
         "status": "pending",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -79,8 +88,10 @@ def decide(approval_id: int, approve: bool, decided_by: str = "human") -> dict:
         raise ValueError(f"이미 처리된 요청: {approval_id} ({item['status']})")
 
     if approve:
-        run = jobs.terminate if item["action"] == "terminate" else jobs.restart
-        item["result"] = run(item["job_id"])
+        if item["action"] == "terminate":
+            item["result"] = jobs.terminate(item["job_id"])
+        else:
+            item["result"] = jobs.restart(item["job_id"], item.get("changes"), item.get("resume_from"))
         item["status"] = "executed"
     else:
         item["status"] = "rejected"

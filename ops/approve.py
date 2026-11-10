@@ -29,6 +29,8 @@ def main():
             print("대기 중인 요청 없음")
         for it in items:
             print(f"[{it['id']}] {it['action']:<9} {it['job_id']:<12} {it['created_at']}  이유: {it['reason']}")
+            if it.get("changes") or it.get("resume_from") is not None:
+                print(f"      변경: {it.get('changes') or '없음'}  재시작 지점: step {it.get('resume_from') or '마지막'}")
         return
 
     if not (args.yes or args.no):

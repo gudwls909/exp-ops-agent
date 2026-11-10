@@ -149,6 +149,30 @@ def recent_log_interval(job_id: str, k: int = 6):
     return max(statistics.median(gaps), 1.0)  # 로그 시각이 초 단위라 1초보다 작게는 못 잰다
 
 
+def read_config(job_id: str) -> dict:
+    """학습 설정(config.json). 실패 주입 옵션은 들어 있지 않다 (시뮬레이터가 애초에 안 쓴다)."""
+    path = os.path.join(job_dir(job_id), "config.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+CKPT_RE = re.compile(r"^ckpt-(\d+)\.pt$")
+
+
+def checkpoints(job_id: str) -> list[dict]:
+    """step별 체크포인트 목록 + 그 step에 로그로 찍힌 loss. 어느 체크포인트가 "망가지기 전"인지 고를 때 쓴다."""
+    d = job_dir(job_id)
+    steps = sorted(int(m.group(1)) for n in os.listdir(d) if (m := CKPT_RE.match(n)))
+    loss_at = {}
+    for line in tail(job_id, 100000):
+        m = STEP_RE.search(line)
+        if m and (lm := LOSS_RE.search(line)):
+            loss_at[int(m.group(1))] = lm.group(1)
+    return [{"step": st, "loss_logged": loss_at.get(st)} for st in steps]
+
+
 # ---------------------------------------------------------------
 # GPU
 # ---------------------------------------------------------------
@@ -223,13 +247,92 @@ def terminate(job_id: str, grace_s: float = 15.0) -> str:
     return f"{job_id}: SIGTERM에 반응 없음 → SIGKILL (pid {pid})"
 
 
-def restart(job_id: str) -> str:
-    """죽은 job을 같은 명령 + --resume으로 다시 띄운다. 살아 있으면 거부."""
+# Agent가 바꾸자고 제안할 수 있는 설정과 허용 범위 (이 밖의 것은 전부 거부)
+#   - 실험의 "정체"를 바꾸는 설정(steps, 모델 구조, seed 등)은 목록에 없다
+#   - data_shards는 "빼기"만 허용한다 (손상된 shard 제외). 새 데이터를 넣는 건 사람이 할 일
+CHANGEABLE = {
+    "max_lr":       (float, 1e-6, 1.0),
+    "stage2_lr":    (float, 1e-6, 1.0),
+    "warmup_steps": (int, 1, 100_000),
+    "batch_size":   (int, 1, 1 << 20),
+    "stage2_batch": (int, 1, 1 << 24),
+    "grad_accum":   (int, 1, 1024),
+    "data_shards":  (str, None, None),
+}
+
+
+def validate_changes(job_id: str, changes: dict | None, resume_from: int | None) -> tuple[dict, int | None]:
+    """제안된 변경을 검사해서 정리된 형태로 돌려준다. 하나라도 이상하면 ValueError (승인 요청 자체를 만들지 않는다)."""
+    changes = {k: v for k, v in (changes or {}).items() if v is not None}
+    config = read_config(job_id)
+    clean = {}
+    for key, value in changes.items():
+        if key not in CHANGEABLE:
+            raise ValueError(f"바꿀 수 없는 설정: {key} (가능: {sorted(CHANGEABLE)})")
+        typ, lo, hi = CHANGEABLE[key]
+        if key == "data_shards":
+            new = [int(x) for x in str(value).split(",") if x.strip() != ""]
+            old = [int(x) for x in str(config.get("data_shards", "")).split(",") if x.strip() != ""]
+            if not new or not set(new) <= set(old):
+                raise ValueError(f"data_shards는 기존 shard {old}에서 빼는 것만 가능: {new}")
+            clean[key] = ",".join(map(str, new))
+            continue
+        try:
+            v = typ(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} 값이 이상함: {value!r}")
+        if not (lo <= v <= hi):
+            raise ValueError(f"{key}={v}는 허용 범위 [{lo}, {hi}] 밖")
+        clean[key] = v
+    if resume_from is not None:
+        steps = [c["step"] for c in checkpoints(job_id)]
+        if int(resume_from) not in steps:
+            raise ValueError(f"step {resume_from} 체크포인트 없음 (있는 것: {steps})")
+        resume_from = int(resume_from)
+    return clean, resume_from
+
+
+def _without_flags(cmd: list[str], flags: set[str]) -> list[str]:
+    """명령줄에서 '--flag 값' (또는 값 없는 --resume) 을 뺀다."""
+    out, skip = [], False
+    for i, tok in enumerate(cmd):
+        if skip:
+            skip = False
+            continue
+        if tok in flags:
+            has_value = tok != "--resume" and i + 1 < len(cmd) and not cmd[i + 1].startswith("--")
+            skip = has_value
+            continue
+        out.append(tok)
+    return out
+
+
+def restart(job_id: str, changes: dict | None = None, resume_from: int | None = None) -> str:
+    """(살아 있으면 먼저 종료하고) 설정을 바꿔서 체크포인트부터 다시 띄운다.
+    changes 없으면 같은 설정으로 재시작. resume_from 없으면 마지막 체크포인트부터."""
+    changes, resume_from = validate_changes(job_id, changes, resume_from)
     job = read_job(job_id)
+    notes = []
     if is_alive(job["pid"], job_id):
-        return f"{job_id}: 아직 살아 있어서 재시작하지 않음 (먼저 terminate 필요)"
-    cmd = [job.get("python", "python")] + job["cmd"] + (["--resume"] if "--resume" not in job["cmd"] else [])
+        notes.append(terminate(job_id))
+
+    flags = {"--" + k.replace("_", "-") for k in changes} | {"--resume", "--resume-from"}
+    cmd = _without_flags(job["cmd"], flags)
+    for k, v in changes.items():
+        cmd += ["--" + k.replace("_", "-"), str(v)]
+    cmd += ["--resume-from", str(resume_from)] if resume_from is not None else ["--resume"]
+
+    # 무엇을 왜 바꿨는지 기록 (나중에 "검증된 조치"를 skill로 저장할 때 쓴다)
+    hist_path = os.path.join(job_dir(job_id), "changes.json")
+    history = json.load(open(hist_path)) if os.path.exists(hist_path) else []
+    history.append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "changes": changes, "resume_from": resume_from,
+                    "config_before": read_config(job_id)})
+    with open(hist_path, "w") as f:
+        json.dump(history, f, indent=2)
+
     log = open(os.path.join(job_dir(job_id), "restart.out"), "a")
-    p = subprocess.Popen(cmd, cwd=job.get("cwd", ROOT), stdout=log, stderr=subprocess.STDOUT,
-                         start_new_session=True)  # 우리 프로세스가 끝나도 job은 계속 돌게
-    return f"{job_id}: --resume으로 재시작 (새 pid {p.pid})"
+    p = subprocess.Popen([job.get("python", "python")] + cmd, cwd=job.get("cwd", ROOT), stdout=log,
+                         stderr=subprocess.STDOUT, start_new_session=True)  # 우리 프로세스가 끝나도 job은 계속 돌게
+    where = f"step {resume_from}" if resume_from is not None else "마지막 체크포인트"
+    notes.append(f"{job_id}: {where}부터 재시작, 변경 {changes or '없음'} (새 pid {p.pid})")
+    return " / ".join(notes)

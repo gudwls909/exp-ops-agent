@@ -52,6 +52,7 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
    - last_loss, last_step_time_s는 "마지막으로 찍힌 줄"의 값이다. 멈춘 job도 멈추기 직전 줄은 정상이므로,
      이 값이 정상이라고 해서 지금 진행 중이라는 뜻은 아니다.
 3. 필요하면 gpu_status, job_status를 쓴다.
+4. 재시작을 제안할 job은 job_config로 설정을 보고, list_checkpoints로 어느 체크포인트부터 다시 할지 고른다.
 
 진단 종류 (diagnosis)
 - healthy              : 정상 진행 중
@@ -61,14 +62,22 @@ SYSTEM_PROMPT = """너는 GPU 학습 서버를 돌보는 운영(ops) 엔지니�
 - hung_at_shutdown     : 학습은 끝났다는 로그(Iteration limit reached 등)가 있는데 프로세스가 안 끝남
 - crashed              : 예외(traceback)로 죽음 (OOM 제외)
 - oom                  : CUDA out of memory로 죽음
-- nan_loss             : loss가 nan/inf인데 계속 돌고 있음 (GPU 낭비)
+- nan_loss             : loss가 nan/inf이거나 갑자기 폭주(예: 0.02 → 1e+31)했는데 계속 돌고 있음 (GPU 낭비)
 - unknown              : 판단할 근거가 부족함
 
 조치 정책 (보고서의 action_requested. 여기 적은 조치가 그대로 사람에게 승인 요청으로 간다)
-- hung, hung_at_shutdown, nan_loss → terminate 요청
-- hung으로 종료된 job은 이전 체크포인트가 정상이므로 종료 후 restart가 적절하다. 단 아직 살아 있으면 terminate만 먼저 요청한다
-- crashed, oom → 이미 죽었으므로 요청하지 않는다. 그대로 재시작하면 같은 실패가 반복되므로 원인과 고칠 점을 보고서에 쓴다
-- healthy, slow_but_progressing, finished, unknown → 요청하지 않는다
+- restart는 "살아 있으면 먼저 종료한 뒤, changes로 설정을 바꿔 resume_from_step 체크포인트부터 다시 실행"이다.
+  원인을 고치지 않고 그대로 재시작하면 같은 실패가 반복된다. 원인이 설정에 있으면 반드시 그 설정을 고쳐라.
+- hung             → restart. changes 없음 (일시적 멈춤이므로 같은 설정으로), resume_from_step은 null(마지막 체크포인트)
+- hung_at_shutdown → terminate (학습은 이미 끝났으므로 재시작 불필요)
+- nan_loss         → restart. 원인 설정(로그에서 loss가 망가진 시점에 바뀐 lr 등)을 job_config에서 찾아 안전한 값으로 낮춘다.
+                     resume_from_step은 list_checkpoints에서 loss가 아직 정상이던 마지막 체크포인트 (망가진 뒤 저장된 것은 쓰지 마라)
+- oom              → restart. 실질 batch size는 유지하고 grad_accum을 늘려 한 번에 올라가는 batch를 줄인다
+                     (batch 자체를 줄이면 실험 의미가 바뀐다). resume_from_step은 null
+- crashed          → 원인이 손상된 데이터 shard면 restart로 그 shard를 data_shards에서 뺀다 (데이터가 바뀌므로
+                     recommendation에 "사람 확인 필요"를 쓴다). 다른 원인이면 none으로 두고 원인만 보고
+- healthy, slow_but_progressing, finished, unknown → none
+- 원인과 관련된 설정만 최소한으로 바꾼다. 바꾸지 않을 설정은 changes에서 null로 둔다
 - 실험을 잘못 죽이는 것이 가장 비싼 실수다. 확신이 없으면 요청하지 말고 unknown으로 보고하라
 - evidence에는 사람이 승인 여부를 바로 판단할 수 있게 근거(로그 내용, 수치)를 쓴다
 
@@ -91,9 +100,27 @@ REPORT_FORMAT = {
                             "diagnosis": {"type": "string", "enum": DIAGNOSES},
                             "evidence": {"type": "string"},
                             "action_requested": {"type": "string", "enum": ["none", "terminate", "restart"]},
+                            # restart일 때만 의미 있음. 바꾸지 않는 설정은 null
+                            "changes": {
+                                "type": "object",
+                                "properties": {
+                                    "max_lr": {"type": ["number", "null"]},
+                                    "stage2_lr": {"type": ["number", "null"]},
+                                    "warmup_steps": {"type": ["integer", "null"]},
+                                    "batch_size": {"type": ["integer", "null"]},
+                                    "stage2_batch": {"type": ["integer", "null"]},
+                                    "grad_accum": {"type": ["integer", "null"]},
+                                    "data_shards": {"type": ["string", "null"], "description": "예: \"0,1,2,4\""},
+                                },
+                                "required": ["max_lr", "stage2_lr", "warmup_steps", "batch_size", "stage2_batch",
+                                             "grad_accum", "data_shards"],
+                                "additionalProperties": False,
+                            },
+                            "resume_from_step": {"type": ["integer", "null"]},
                             "recommendation": {"type": "string"},
                         },
-                        "required": ["job_id", "diagnosis", "evidence", "action_requested", "recommendation"],
+                        "required": ["job_id", "diagnosis", "evidence", "action_requested", "changes",
+                                     "resume_from_step", "recommendation"],
                         "additionalProperties": False,
                     },
                 },
@@ -150,9 +177,14 @@ def file_requests(report: dict) -> list[dict]:
         if j["action_requested"] == "none":
             continue
         try:
-            item = approvals.request(j["job_id"], j["action_requested"], f"[{j['diagnosis']}] {j['evidence']}")
-            filed.append({"job_id": j["job_id"], "action": item["action"], "approval_id": item["id"]})
-        except ValueError as e:  # LLM이 없는 job_id를 지어낸 경우 등
+            extra = {}
+            if j["action_requested"] == "restart":
+                extra = {"changes": {k: v for k, v in (j.get("changes") or {}).items() if v is not None},
+                         "resume_from": j.get("resume_from_step")}
+            item = approvals.request(j["job_id"], j["action_requested"], f"[{j['diagnosis']}] {j['evidence']}", **extra)
+            filed.append({"job_id": j["job_id"], "action": item["action"], "approval_id": item["id"],
+                          "changes": item.get("changes"), "resume_from": item.get("resume_from")})
+        except ValueError as e:  # LLM이 없는 job_id를 지어낸 경우, 허용 범위 밖의 설정을 제안한 경우 등
             filed.append({"job_id": j["job_id"], "action": j["action_requested"], "error": str(e)})
     return filed
 

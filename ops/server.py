@@ -1,7 +1,7 @@
 """
 MCP ops 서버 — week1 step3_docs_server.py와 같은 구조, 도구만 다르다
 
-Agent에게 주는 도구: 읽기 전용 4개 (list_jobs, job_status, tail_log, gpu_status)
+Agent에게 주는 도구: 읽기 전용 6개 (list_jobs, job_status, tail_log, gpu_status, job_config, list_checkpoints)
   - 실행 도구(kill/restart)는 아예 없다
   - 승인 요청도 도구로 주지 않는다. Agent가 보고서에 쓴 조치를 "코드"가 승인 대기열에 넣는다 (agent/agent.py)
     이유: 도구로 줬더니 보고서엔 "terminate 요청"이라 쓰고 실제로는 도구를 안 부른 경우가 있었다 (말과 행동 불일치)
@@ -73,6 +73,26 @@ def gpu_status() -> str:
         "gpus": jobs.gpus(),
         "processes": [{"pid": p, "mem_mib": m, "job_id": pid_to_job.get(p)} for p, m in mem.items()],
     })
+
+
+@mcp.tool()
+def job_config(job_id: str) -> str:
+    """job의 학습 설정(하이퍼파라미터): max_lr, warmup_steps, batch_size, stage2_at/stage2_batch/stage2_lr(커리큘럼 2단계),
+    grad_accum, data_shards 등. 실패 원인이 설정에 있는지 볼 때, 고칠 설정을 제안할 때 쓴다."""
+    try:
+        return _ok({"job_id": job_id, "config": jobs.read_config(job_id)})
+    except ValueError as e:
+        return _err(e)
+
+
+@mcp.tool()
+def list_checkpoints(job_id: str) -> str:
+    """job의 step별 체크포인트 목록과 각 step에서 로그에 찍힌 loss.
+    loss가 망가지기(nan/폭주) '전'의 체크포인트를 골라 거기서부터 재시작을 제안할 때 쓴다."""
+    try:
+        return _ok({"job_id": job_id, "checkpoints": jobs.checkpoints(job_id)})
+    except ValueError as e:
+        return _err(e)
 
 
 if __name__ == "__main__":
